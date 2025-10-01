@@ -66,6 +66,9 @@ def prepare_conversation(
     user: User,
     chat_input: ChatInput,
 ) -> tuple[str, ConversationModel, BotModel | None]:
+    logger.info(
+        f"[START] prepare_conversation called with user={user}, chat_input={chat_input}"
+    )
     current_time = get_current_time()
     bot = None
 
@@ -175,12 +178,18 @@ def prepare_conversation(
             or "instruction"
         )
 
+    logger.info(
+        f"[END] prepare_conversation returning (message_id={message_id}, conversation={conversation}, bot={bot})"
+    )
     return (message_id, conversation, bot)
 
 
 def trace_to_root(
     node_id: str | None, message_map: dict[str, MessageModel]
 ) -> list[SimpleMessageModel]:
+    logger.info(
+        f"[START] trace_to_root called with node_id={node_id}, message_map_keys={list(message_map.keys())}"
+    )
     """Trace message map from leaf node to root node."""
     result: list[SimpleMessageModel] = []
     if not node_id or node_id == "system":
@@ -205,6 +214,7 @@ def trace_to_root(
             break
         current_node = message_map.get(parent_id)
 
+    logger.info(f"[END] trace_to_root returning result={result[::-1]}")
     return result[::-1]
 
 
@@ -217,6 +227,7 @@ def chat(
     on_tool_result: Callable[[ToolRunResult], None] | None = None,
     on_reasoning: Callable[[str], None] | None = None,
 ) -> tuple[ConversationModel, MessageModel]:
+    logger.info(f"[START] chat called with user={user}, chat_input={chat_input}")
     user_msg_id, conversation, bot = prepare_conversation(user, chat_input)
 
     # # Set tools only when tooluse is supported
@@ -498,6 +509,7 @@ def chat(
         # Update bot stats
         modify_bot_stats(user, bot, increment=1)
 
+    logger.info(f"[END] chat returning (conversation={conversation}, message={message})")
     return conversation, message
 
 
@@ -505,7 +517,10 @@ def chat_output_from_message(
     conversation: ConversationModel,
     message: MessageModel,
 ) -> ChatOutput:
-    return ChatOutput(
+    logger.info(
+        f"[START] chat_output_from_message called with conversation={conversation}, message={message}"
+    )
+    result = ChatOutput(
         conversation_id=conversation.id,
         create_time=conversation.create_time,
         message=MessageOutput(
@@ -536,6 +551,8 @@ def chat_output_from_message(
         ),
         bot_id=conversation.bot_id,
     )
+    logger.info(f"[END] chat_output_from_message returning ChatOutput")
+    return result
 
 
 def propose_conversation_title(
@@ -543,6 +560,9 @@ def propose_conversation_title(
     conversation_id: str,
     model: type_model_name = "claude-v3-haiku",
 ) -> str:
+    logger.info(
+        f"[START] propose_conversation_title called with user_id={user_id}, conversation_id={conversation_id}, model={model}"
+    )
     PROMPT = """Reading the conversation above, what is the appropriate title for the conversation? When answering the title, please follow the rules below:
 <rules>
 - Title length must be from 15 to 20 characters.
@@ -595,10 +615,14 @@ def propose_conversation_title(
         else ""
     )
 
+    logger.info(f"[END] propose_conversation_title returning reply_txt={reply_txt}")
     return reply_txt
 
 
 def fetch_conversation(user_id: str, conversation_id: str) -> Conversation:
+    logger.info(
+        f"[START] fetch_conversation called with user_id={user_id}, conversation_id={conversation_id}"
+    )
     conversation = find_conversation_by_id(user_id, conversation_id)
 
     message_map = {
@@ -655,10 +679,12 @@ def fetch_conversation(user_id: str, conversation_id: str) -> Conversation:
         bot_id=conversation.bot_id,
         should_continue=conversation.should_continue,
     )
+    logger.info(f"[END] fetch_conversation returning output={output}")
     return output
 
 
 def search_conversations(query: str, user: User) -> list[ConversationSearchResult]:
+    logger.info(f"[START] search_conversations called with query={query}, user={user}")
     """Search conversations by keyword"""
     conversations = find_conversations_by_query(query, user)
     output = []
@@ -685,4 +711,5 @@ def search_conversations(query: str, user: User) -> list[ConversationSearchResul
             )
         )
 
+    logger.info(f"[END] search_conversations returning output={output}")
     return output

@@ -14,10 +14,14 @@ logger.setLevel(logging.DEBUG)
 def get_knowledge_base_info(
     knowledge_base_id: str | None,
 ) -> BedrockAgentGetKnowledgeBaseResponse:
+    logger.info(
+        f"[START] get_knowledge_base_info called with knowledge_base_id={knowledge_base_id}"
+    )
     client = get_bedrock_agent_client()
     try:
         response = client.get_knowledge_base(knowledgeBaseId=knowledge_base_id)
-        return BedrockAgentGetKnowledgeBaseResponse(
+        logger.info(f"[INFO] get_knowledge_base_info received response={response}")
+        result = BedrockAgentGetKnowledgeBaseResponse(
             knowledge_base=KnowledgeBase(
                 knowledge_base_configuration=KnowledgeBaseConfiguration(
                     type=response.get("knowledgeBase", {})
@@ -26,10 +30,14 @@ def get_knowledge_base_info(
                 )
             )
         )
+        logger.info(f"[END] get_knowledge_base_info returning {result}")
+        return result
     except Exception as e:
-        logger.error(f"Failed to get knowledge base info: {e}")
-        return BedrockAgentGetKnowledgeBaseResponse(
+        logger.error(f"[ERROR] get_knowledge_base_info failed: {e}")
+        result = BedrockAgentGetKnowledgeBaseResponse(
             knowledge_base=KnowledgeBase(
                 knowledge_base_configuration=KnowledgeBaseConfiguration(type="VECTOR")
             )
         )
+        logger.info(f"[END] get_knowledge_base_info returning fallback {result}")
+        return result

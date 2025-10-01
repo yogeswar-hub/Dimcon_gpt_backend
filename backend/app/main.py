@@ -3,6 +3,18 @@ import os
 import traceback
 from typing import Callable
 
+# Load environment variables FIRST
+from dotenv import load_dotenv
+load_dotenv()
+
+# Debug environment variables (remove after testing)
+print("=== Environment Variables Debug ===")
+print(f"CONVERSATION_TABLE_NAME: '{os.environ.get('CONVERSATION_TABLE_NAME', 'NOT SET')}'")
+print(f"USER_TABLE_NAME: '{os.environ.get('USER_TABLE_NAME', 'NOT SET')}'") 
+print(f"BOT_TABLE_NAME: '{os.environ.get('BOT_TABLE_NAME', 'NOT SET')}'")
+print(f"CORS_ALLOW_ORIGINS: '{os.environ.get('CORS_ALLOW_ORIGINS', 'NOT SET')}'")
+print("===================================")
+
 from app.dependencies import get_current_user
 from app.repositories.common import (
     RecordAccessNotAllowedError,
@@ -70,7 +82,6 @@ if not is_published_api:
 else:
     app.include_router(published_api_router)
 
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOW_ORIGINS.split(","),
@@ -112,19 +123,25 @@ def add_current_user_to_request(request: Request, call_next: ASGIApp):
                     scheme="Bearer", credentials=token_str
                 )
                 request.state.current_user = get_current_user(token)
+                logger.info(f"[USER] Authenticated via token: {request.state.current_user}")
+            else:
+                logger.warning("[USER] No Authorization header found on Lambda.")
         else:
             assert PUBLISHED_API_ID is not None, "PUBLISHED_API_ID is not set."
             request.state.current_user = User.from_published_api_id(PUBLISHED_API_ID)
+            logger.info(f"[USER] Using published API ID: {PUBLISHED_API_ID}")
     else:
         authorization = request.headers.get("Authorization")
         if authorization:
             token_str = authorization.split(" ")[1]
             token = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token_str)
             request.state.current_user = get_current_user(token)
+            logger.info(f"[USER] Authenticated via token: {request.state.current_user}")
         else:
             request.state.current_user = User(
-                id="test_user", name="test_user", email="user@example.com", groups=[]
+                id="548814b8-6021-70d7-624b-ca8e7d8daf32", name="nikethsaiavirneni@dimconinc.com", email="nikethsaiavirneni@dimconinc.com", groups=[]
             )
+            logger.info(f"[USER] Using default local user: {request.state.current_user}")
 
     response = call_next(request)  # type: ignore
     return response

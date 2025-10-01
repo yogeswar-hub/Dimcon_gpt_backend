@@ -40,7 +40,8 @@ def search_result_to_related_document(
     search_result: SearchResult,
     source_id_base: str,
 ) -> RelatedDocumentModel:
-    return RelatedDocumentModel(
+    logger.info(f"[START] search_result_to_related_document called with search_result={search_result}, source_id_base={source_id_base}")
+    result = RelatedDocumentModel(
         content=TextToolResultModel(
             text=search_result["content"],
         ),
@@ -49,13 +50,15 @@ def search_result_to_related_document(
         source_link=search_result["source_link"],
         page_number=search_result["page_number"],
     )
+    logger.info(f"[END] search_result_to_related_document returning {result}")
+    return result
 
 
 def to_guardrails_grounding_source(
     search_results: list[SearchResult],
 ) -> GuardrailConverseContentBlockTypeDef | None:
-    """Convert search results to Guardrails Grounding source format."""
-    return (
+    logger.info(f"[START] to_guardrails_grounding_source called with search_results={search_results}")
+    result = (
         {
             "text": {
                 "text": "\n\n".join(x["content"] for x in search_results),
@@ -65,9 +68,12 @@ def to_guardrails_grounding_source(
         if len(search_results) > 0
         else None
     )
+    logger.info(f"[END] to_guardrails_grounding_source returning {result}")
+    return result
 
 
 def _bedrock_knowledge_base_search(bot: BotModel, query: str) -> list[SearchResult]:
+    logger.info(f"[START] _bedrock_knowledge_base_search called with bot={bot}, query={query}")
     assert bot.bedrock_knowledge_base is not None
     assert (
         bot.bedrock_knowledge_base.knowledge_base_id is not None
@@ -80,10 +86,10 @@ def _bedrock_knowledge_base_search(bot: BotModel, query: str) -> list[SearchResu
     elif bot.bedrock_knowledge_base.search_params.search_type == "hybrid":
         search_type = "HYBRID"
     else:
+        logger.error(f"Invalid search type: {bot.bedrock_knowledge_base.search_params.search_type}")
         raise ValueError("Invalid search type")
 
     limit = bot.bedrock_knowledge_base.search_params.max_results
-    # Use exist_knowledge_base_id if available, otherwise use knowledge_base_id
     knowledge_base_id = (
         bot.bedrock_knowledge_base.exist_knowledge_base_id
         if bot.bedrock_knowledge_base.exist_knowledge_base_id is not None
@@ -92,19 +98,18 @@ def _bedrock_knowledge_base_search(bot: BotModel, query: str) -> list[SearchResu
     assert knowledge_base_id is not None, "knowledge_base_id must be set"
 
     try:
-        # Init retrieve parameter
         retrieve_parameter: RetrieveRequestTypeDef = {
             "knowledgeBaseId": knowledge_base_id,
             "retrievalQuery": {"text": query},
             "retrievalConfiguration": {
                 "vectorSearchConfiguration": {
                     "numberOfResults": limit,
-                    "overrideSearchType": search_type,
+                    "overrideSearchType": "SEMANTIC",
                 }
             },
         }
+        logger.info(f"[INFO] _bedrock_knowledge_base_search retrieve_parameter={retrieve_parameter}")
 
-        # Omit overrideSearchType parameter if needed
         def omit_override_search_type_parameter(
             retrieve_parameter: RetrieveRequestTypeDef,
         ):
@@ -113,29 +118,26 @@ def _bedrock_knowledge_base_search(bot: BotModel, query: str) -> list[SearchResu
                     "vectorSearchConfiguration", {}
                 )
             )
-            # If overrideSearchType exists, remove it
             if "overrideSearchType" in target_parameter:
                 del target_parameter["overrideSearchType"]
 
-        # Get Knowledge Base from Bedrock Agent API :: get_knowledge_base
         knowledge_base_info = get_knowledge_base_info(
             knowledge_base_id=knowledge_base_id
         )
-        # Check the knowledge base resource type
+        logger.info(f"[INFO] _bedrock_knowledge_base_search knowledge_base_info={knowledge_base_info}")
+
         if (
             knowledge_base_info.knowledge_base.knowledge_base_configuration.type
             == "KENDRA"
         ):
-            # Omit overrideSearchType option when the type is "KENDRA"
             omit_override_search_type_parameter(retrieve_parameter)
 
-        # Send retrieve request
         response = agent_client.retrieve(**retrieve_parameter)
+        logger.info(f"[INFO] _bedrock_knowledge_base_search response={response}")
 
         def extract_source_from_retrieval_result(
             retrieval_result: KnowledgeBaseRetrievalResultTypeDef,
         ) -> tuple[str, str] | None:
-            """Extract source URL/URI from retrieval result based on location type."""
             location = retrieval_result.get("location", {})
             location_type = location.get("type")
 
@@ -172,7 +174,6 @@ def _bedrock_knowledge_base_search(bot: BotModel, query: str) -> list[SearchResu
             source = extract_source_from_retrieval_result(retrieval_result)
 
             if source is not None:
-                # get page number from metadata
                 metadata = retrieval_result.get("metadata", {})
                 page_number = None
                 if "x-amz-bedrock-kb-document-page-number" in metadata:
@@ -194,13 +195,23 @@ def _bedrock_knowledge_base_search(bot: BotModel, query: str) -> list[SearchResu
                         page_number=page_number,
                     )
                 )
-
+        logger.info(f"[END] _bedrock_knowledge_base_search returning search_results={search_results}")
         return search_results
 
     except ClientError as e:
-        logger.error(f"Error querying Bedrock Knowledge Base: {e}")
-        raise e
+        # Graceful degradation with fallback
+        if "HYBRID search type is not supported" in str(e) and search_type == "HYBRID":
+            logger.warning(f"HYBRID search not supported, falling back to SEMANTIC for knowledge base {knowledge_base_id}")
+            # Retry with SEMANTIC
+            retrieve_parameter["retrievalConfiguration"]["vectorSearchConfiguration"]["overrideSearchType"] = "SEMANTIC"
+            response = agent_client.retrieve(**retrieve_parameter)
+        else:
+            logger.error(f"Error querying Bedrock Knowledge Base: {e}")
+            raise e
 
 
 def search_related_docs(bot: BotModel, query: str) -> list[SearchResult]:
-    return _bedrock_knowledge_base_search(bot, query)
+    logger.info(f"[START] search_related_docs called with bot={bot}, query={query}")
+    results = _bedrock_knowledge_base_search(bot, query)
+    logger.info(f"[END] search_related_docs returning results={results}")
+    return results

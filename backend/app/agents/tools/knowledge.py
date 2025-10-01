@@ -22,6 +22,9 @@ class KnowledgeToolInput(BaseModel):
 def search_knowledge(
     tool_input: KnowledgeToolInput, bot: BotModel | None, model: type_model_name | None
 ) -> list:
+    logger.info(
+        f"[START] search_knowledge called with tool_input={tool_input}, bot={bot}, model={model}"
+    )
     assert bot is not None
 
     query = tool_input.query
@@ -32,10 +35,9 @@ def search_knowledge(
             bot,
             query=query,
         )
-
-        # # For testing purpose
-        # search_results = dummy_search_results
-
+        logger.info(
+            f"[END] search_knowledge returning search_results={search_results}"
+        )
         return search_results
 
     except Exception as e:
@@ -52,10 +54,13 @@ def create_knowledge_tool(bot: BotModel) -> AgentTool:
             bot.knowledge.__str_in_claude_format__()
         )
     )
+    logger.info(f"[START] create_knowledge_tool called with bot={bot}")
     logger.info(f"Creating knowledge base tool with description: {description}")
-    return AgentTool(
+    agent_tool = AgentTool(
         name=f"knowledge_base_tool",
         description=description,
         args_schema=KnowledgeToolInput,
         function=search_knowledge,
     )
+    logger.info(f"[END] create_knowledge_tool returning agent_tool={agent_tool}")
+    return agent_tool
