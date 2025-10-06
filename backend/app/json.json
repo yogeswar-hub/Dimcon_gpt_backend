@@ -1,0 +1,62 @@
+{
+    "chunking_configuration": {
+        "M": {
+            "chunking_strategy": {
+                "S": "default"
+            }
+        }
+    },
+    "data_source_ids": {
+        "L": []
+    },
+    "embeddings_model": {
+        "S": "titan_v2"
+    },
+    "exist_knowledge_base_id": {
+        "S": "S9TYXFBOYB"
+    },
+    "knowledge_base_id": {
+        "S": "S9TYXFBOYB"
+    },
+    "open_search": {
+        "M": {
+            "analyzer": {
+                "NULL": true
+            }
+        }
+    },
+    "parsing_model": {
+        "S": "disabled"
+    },
+    "search_params": {
+        "M": {
+            "max_results": {
+                "N": "5"
+            },
+            "search_type": {
+                "S": "hybrid"
+            }
+        }
+    },
+    "web_crawling_filters": {
+        "M": {
+            "exclude_patterns": {
+                "L": [
+                    {
+                        "S": ""
+                    }
+                ]
+            },
+            "include_patterns": {
+                "L": [
+                    {
+                        "S": ""
+                    }
+                ]
+            }
+        }
+    },
+    "web_crawling_scope": {
+        "S": "DEFAULT"
+    }
+}

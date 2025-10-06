@@ -93,3 +93,4 @@ class BedrockKnowledgeBaseModel(BaseModel):
     web_crawling_filters: WebCrawlingFiltersModel = WebCrawlingFiltersModel(
         exclude_patterns=[], include_patterns=[]
     )
+    resource_type: type_kb_resource_type = "bedrock"  # Add this field

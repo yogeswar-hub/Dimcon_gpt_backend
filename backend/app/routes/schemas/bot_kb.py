@@ -37,7 +37,13 @@ type_os_token_filter = Literal[
 
 # Knowledge Base Type
 # Ref: https://docs.aws.amazon.com/bedrock/latest/APIReference/API_agent_KnowledgeBaseConfiguration.html#bedrock-Type-agent_KnowledgeBaseConfiguration-type
-type_kb_resource_type = Literal["VECTOR", "KENDRA", "SQL"]
+type_kb_resource_type = Literal[
+    "bedrock",
+    "redshift",
+    "opensearch",
+    "kendra",
+    "sql"
+]
 
 
 class SearchParams(BaseSchema):
@@ -106,6 +112,7 @@ class BedrockKnowledgeBaseInput(BaseSchema):
     web_crawling_filters: WebCrawlingFilters = WebCrawlingFilters(
         exclude_patterns=[], include_patterns=[]
     )
+    resource_type: type_kb_resource_type = "bedrock"  # Default value
 
 
 class BedrockKnowledgeBaseOutput(BaseSchema):
@@ -128,3 +135,4 @@ class BedrockKnowledgeBaseOutput(BaseSchema):
     web_crawling_filters: WebCrawlingFilters = WebCrawlingFilters(
         exclude_patterns=[], include_patterns=[]
     )
+    resource_type: type_kb_resource_type = "bedrock"  # Default value

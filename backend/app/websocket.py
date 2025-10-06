@@ -235,57 +235,104 @@ def handler(event, context):
             nlq = body.get("nlq")
             logger.info(f"SuiteQL route called with NLQ: {nlq}")
 
+            # Store connectionId in DynamoDB for this SuiteQL session
+            table.put_item(
+                Item={
+                    "ConnectionId": connection_id,
+                    "MessagePartId": decimal(0),
+                    "Step": "SUITEQL",
+                    "NLQ": nlq,
+                    "expire": expire,
+                }
+            )
+            logger.info(f"Stored connectionId {connection_id} for SUITEQL step.")
+
+            notificator.notify(json.dumps({
+                "status": "PROCESSING",
+                "message": "Processing SuiteQL query..."
+            }).encode("utf-8"))
+
             result = process_nl2sql_query(nlq)
-            # Decimal/date-safe logging to avoid exceptions
             logger.info(
                 "SuiteQL detailed result: %s",
                 json.dumps(result, indent=2, default=_json_default),
             )
 
+            if "error" in result:
+                error_payload = {
+                    "status": "ERROR",
+                    "nlq": nlq,
+                    "error": result["error"],
+                    "message": "SuiteQL query failed.",
+                }
+                notificator.notify(json.dumps(error_payload, default=_json_default).encode("utf-8"))
+                logger.warning(f"SuiteQL error returned to client: {result['error']}")
+                return {"statusCode": 500, "body": json.dumps(error_payload)}
+
             items = result.get("result", {}).get("items", []) or []
+            text_for_chart = suiteql_items_to_text_for_chart(items)
 
-            # Use ALL rows for chart & payload
-            chart_input_rows = items
+            # Detect requested chart type from NLQ
+            requested_type = None
+            for chart_type in [
+                "bar", "line", "pie", "doughnut", "radar", "area", "scatter", "bubble",
+                "radialBar", "matrix", "treemap", "sunburst", "candlestick", "ohlc", "wordcloud"
+            ]:
+                if chart_type in (nlq or "").lower():
+                    requested_type = chart_type
+                    break
 
-            # === AI chart generation via external module ===
-            chat_message = None
-            chart_spec = None
-            if USE_AI_FOR_CHARTS:
-                try:
-                    # Force chart type if user said "pie/bar/line" in NLQ
-                    txt = (nlq or "").lower()
-                    preferred_type = (
-                        "pie" if "pie" in txt else "bar" if "bar" in txt else "line" if "line" in txt else None
-                    )
+            chart_specs = []
+            used_types = set()
 
-                    text_for_chart = suiteql_items_to_text_for_chart(chart_input_rows)
-                    if text_for_chart:
-                        chart_spec = generate_chart_spec(text_for_chart, preferred_type=preferred_type)
-                        chat_message = wrap_chartjs_message(
-                            "Here is the SuiteQL result view.",
-                            chart_spec,
-                            height=260,
-                        )
-                        logger.info("Chart spec generated and wrapped for frontend.")
-                except Exception as e:
-                    logger.warning(f"SuiteQL AI chart generation failed: {e}")
+            if items and text_for_chart and len(text_for_chart.strip()) > 0:
+                # First chart: user requested type (if any)
+                if requested_type:
+                    try:
+                        chart_spec = generate_chart_spec(text_for_chart, preferred_type=requested_type)
+                        if chart_spec and chart_spec.get("type"):
+                            chart_specs.append(chart_spec)
+                            used_types.add(chart_spec["type"])
+                    except Exception as e:
+                        logger.warning(f"Chart generation failed for requested type {requested_type}: {e}")
+
+                # Next two charts: AI picks best types, but avoid duplicates
+                ai_types = [t for t in [
+                    "bar", "line", "pie", "doughnut", "radar", "area", "scatter", "bubble",
+                    "radialBar", "matrix", "treemap", "sunburst", "candlestick", "ohlc", "wordcloud"
+                ] if t not in used_types]
+                for _ in range(3 - len(chart_specs)):
+                    for ai_type in ai_types:
+                        try:
+                            chart_spec = generate_chart_spec(text_for_chart, preferred_type=ai_type)
+                            if chart_spec and chart_spec.get("type") and chart_spec["type"] not in used_types:
+                                chart_specs.append(chart_spec)
+                                used_types.add(chart_spec["type"])
+                                break
+                        except Exception as e:
+                            logger.warning(f"Chart generation failed for AI type {ai_type}: {e}")
+
+                # Pad with None if less than 3 charts
+                while len(chart_specs) < 3:
+                    chart_specs.append(None)
+            else:
+                chart_specs = []  # No charts if no informative data
 
             notification_payload = {
                 "status": "SUITEQL_RESULT",
                 "nlq": nlq,
                 "result": {
                     "sql_query": result.get("sql_query"),
-                    "items": items,  # ALL rows
+                    "items": items,
                     "totalResults": len(items),
                 },
+                "summary": result.get("summary"),
                 "message": f"SuiteQL query processed. Showing all {len(items)} records.",
-                "chat_message": chat_message,  # ```chartjs fenced block string
-                "chart_spec": chart_spec,      # optional raw spec
+                "chart_specs": chart_specs
             }
 
             notificator.notify(json.dumps(notification_payload, default=_json_default).encode("utf-8"))
-            logger.info("SuiteQL result notification (with chart) sent.")
-            time.sleep(0.2)
+            logger.info("SuiteQL result notification sent.")
             return {"statusCode": 200, "body": "SuiteQL processed."}
 
         if step == "START":

@@ -21,13 +21,19 @@ def get_knowledge_base_info(
     try:
         response = client.get_knowledge_base(knowledgeBaseId=knowledge_base_id)
         logger.info(f"[INFO] get_knowledge_base_info received response={response}")
+        kb_config = response["knowledgeBase"]["knowledgeBaseConfiguration"]
+        if kb_config["type"] == "SQL":
+            # This is a SQL KB (Redshift)
+            knowledge_base_configuration = KnowledgeBaseConfiguration(type="redshift")
+        elif kb_config["type"] == "VECTOR":
+            # This is a Vector KB
+            knowledge_base_configuration = KnowledgeBaseConfiguration(type="bedrock")
+        else:
+            # Handle other types as needed
+            knowledge_base_configuration = KnowledgeBaseConfiguration(type="bedrock")
         result = BedrockAgentGetKnowledgeBaseResponse(
             knowledge_base=KnowledgeBase(
-                knowledge_base_configuration=KnowledgeBaseConfiguration(
-                    type=response.get("knowledgeBase", {})
-                    .get("knowledgeBaseConfiguration", {})
-                    .get("type", "VECTOR")
-                )
+                knowledge_base_configuration=knowledge_base_configuration
             )
         )
         logger.info(f"[END] get_knowledge_base_info returning {result}")

@@ -22,28 +22,28 @@ class KnowledgeToolInput(BaseModel):
 def search_knowledge(
     tool_input: KnowledgeToolInput, bot: BotModel | None, model: type_model_name | None
 ) -> list:
-    logger.info(
-        f"[START] search_knowledge called with tool_input={tool_input}, bot={bot}, model={model}"
-    )
     assert bot is not None
 
     query = tool_input.query
-    logger.info(f"Running AnswerWithKnowledgeTool with query: {query}")
+    logger.info(f"[search_knowledge] Received query: {query}")
+    logger.info(f"[search_knowledge] Bot ID: {getattr(bot, 'id', None)} | Model: {model}")
 
     try:
+        logger.info(f"[search_knowledge] Initiating search_related_docs for bot '{getattr(bot, 'title', None)}'")
         search_results = search_related_docs(
             bot,
             query=query,
         )
-        logger.info(
-            f"[END] search_knowledge returning search_results={search_results}"
-        )
+        logger.info(f"[search_knowledge] Search returned {len(search_results)} results")
+        for idx, result in enumerate(search_results):
+            logger.debug(f"[search_knowledge] Result {idx}: {result}")
+
         return search_results
 
     except Exception as e:
         error_traceback = traceback.format_exc()
         logger.error(
-            f"Failed to run AnswerWithKnowledgeTool: {e}\nTraceback: {error_traceback}"
+            f"[search_knowledge] Exception: {e}\nTraceback: {error_traceback}"
         )
         raise e
 
@@ -54,13 +54,11 @@ def create_knowledge_tool(bot: BotModel) -> AgentTool:
             bot.knowledge.__str_in_claude_format__()
         )
     )
-    logger.info(f"[START] create_knowledge_tool called with bot={bot}")
-    logger.info(f"Creating knowledge base tool with description: {description}")
-    agent_tool = AgentTool(
+    logger.info(f"[create_knowledge_tool] Creating tool for bot '{getattr(bot, 'title', None)}'")
+    logger.debug(f"[create_knowledge_tool] Tool description: {description}")
+    return AgentTool(
         name=f"knowledge_base_tool",
         description=description,
         args_schema=KnowledgeToolInput,
         function=search_knowledge,
     )
-    logger.info(f"[END] create_knowledge_tool returning agent_tool={agent_tool}")
-    return agent_tool

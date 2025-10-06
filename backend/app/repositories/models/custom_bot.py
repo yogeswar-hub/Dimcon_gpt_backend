@@ -456,6 +456,18 @@ class BotModel(BaseModel):
         return value
 
     def has_knowledge(self) -> bool:
+        if self.has_bedrock_knowledge_base():
+            kb_type = getattr(self.bedrock_knowledge_base, 'resource_type', 'bedrock')
+            logger.info(f"[BotModel.has_knowledge] Bot '{self.id}' has Bedrock Knowledge Base (type: {kb_type})")
+        elif (
+            len(self.knowledge.source_urls) > 0
+            or len(self.knowledge.sitemap_urls) > 0
+            or len(self.knowledge.filenames) > 0
+            or len(self.knowledge.s3_urls) > 0
+        ):
+            logger.info(f"[BotModel.has_knowledge] Bot '{self.id}' has custom Knowledge Base")
+        else:
+            logger.info(f"[BotModel.has_knowledge] Bot '{self.id}' has no knowledge base")
         return (
             len(self.knowledge.source_urls) > 0
             or len(self.knowledge.sitemap_urls) > 0

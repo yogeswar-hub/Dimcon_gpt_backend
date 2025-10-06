@@ -12,7 +12,16 @@ BEDROCK_REGION = os.getenv("BEDROCK_REGION", "us-east-1")
 USE_AI_FOR_CHARTS = os.getenv("USE_AI_FOR_CHARTS", "true").lower() == "true"
 
 # Allowed chart types to avoid typos
-_ALLOWED_TYPES = {"bar", "line", "pie", "doughnut", "radar"}
+_ALLOWED_TYPES = {
+    "bar", "line", "pie", "doughnut", "radar",
+    "area", "scatter", "bubble", "radialBar",
+    "matrix",      # Heatmap
+    "treemap",     # Treemap
+    "sunburst",    # Sunburst
+    "candlestick", # Financial
+    "ohlc",        # Financial
+    "wordcloud"    # Word Cloud
+}
 
 
 def suiteql_items_to_text_for_chart(items: List[dict]) -> str:
@@ -146,6 +155,8 @@ def _generate_with_claude(
         "- Return ONLY valid JSON (no markdown, no backticks)\n"
         "- Include: type, data (labels, datasets), options\n"
         "- Ensure numeric values are numbers, not strings\n"
+        "- For each dataset, include a 'backgroundColor' array with distinct colors based on the data values or categories\n"
+        "- You may use advanced chart types (matrix, treemap, sunburst, candlestick, ohlc, wordcloud) if the data fits. Use Chart.js plugins if needed.\n"
         f"{type_hint}\n"
         f"Text:\n{text_content[:3000]}\n\nJSON:"
     )
@@ -251,3 +262,23 @@ def _fallback_rule_based(text_content: str) -> Dict[str, Any]:
         },
         "options": {"responsive": True}
     }
+
+
+def suiteql_items_to_geojson(items: list) -> dict:
+    features = []
+    for row in items:
+        lat = row.get("lat") or row.get("latitude")
+        lng = row.get("lng") or row.get("longitude") or row.get("lon")
+        if lat is not None and lng is not None:
+            try:
+                lat = float(lat)
+                lng = float(lng)
+            except Exception:
+                continue
+            feature = {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [lng, lat]},
+                "properties": {k: v for k, v in row.items() if k not in ["lat", "lng", "latitude", "longitude", "lon"]}
+            }
+            features.append(feature)
+    return {"type": "FeatureCollection", "features": features}

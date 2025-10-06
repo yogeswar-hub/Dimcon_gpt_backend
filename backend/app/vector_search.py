@@ -104,7 +104,7 @@ def _bedrock_knowledge_base_search(bot: BotModel, query: str) -> list[SearchResu
             "retrievalConfiguration": {
                 "vectorSearchConfiguration": {
                     "numberOfResults": limit,
-                    "overrideSearchType": "SEMANTIC",
+                    "overrideSearchType": search_type,
                 }
             },
         }
@@ -170,31 +170,62 @@ def _bedrock_knowledge_base_search(bot: BotModel, query: str) -> list[SearchResu
 
         search_results = []
         for i, retrieval_result in enumerate(response.get("retrievalResults", [])):
-            content = retrieval_result.get("content", {}).get("text", "")
-            source = extract_source_from_retrieval_result(retrieval_result)
-
-            if source is not None:
-                metadata = retrieval_result.get("metadata", {})
-                page_number = None
-                if "x-amz-bedrock-kb-document-page-number" in metadata:
-                    try:
-                        page_number = int(
-                            metadata["x-amz-bedrock-kb-document-page-number"]
-                        )
-                    except (ValueError, TypeError):
-                        pass
-
+            
+            # Check if this is SQL result (from Redshift KB)
+            if retrieval_result.get("content", {}).get("type") == "ROW":
+                # Handle SQL row results
+                row_data = retrieval_result.get("content", {}).get("row", [])
+                
+                # Convert row data to readable text
+                content_parts = []
+                for column in row_data:
+                    column_name = column.get("columnName", "")
+                    column_value = column.get("columnValue", "")
+                    content_parts.append(f"{column_name}: {column_value}")
+                
+                content = " | ".join(content_parts)
+                
+                # Get SQL query for source reference
+                sql_query = retrieval_result.get("location", {}).get("sqlLocation", {}).get("query", "SQL Query")
+                
                 search_results.append(
                     SearchResult(
                         rank=i,
                         bot_id=bot.id,
                         content=content,
-                        source_name=source[0],
-                        source_link=source[1],
-                        metadata=metadata,
-                        page_number=page_number,
+                        source_name=f"SQL Result {i+1}",
+                        source_link=sql_query,
+                        metadata={"query": sql_query},
+                        page_number=None,
                     )
                 )
+            else:
+                # Handle document-based results (existing code)
+                content = retrieval_result.get("content", {}).get("text", "")
+                source = extract_source_from_retrieval_result(retrieval_result)
+
+                if source is not None:
+                    metadata = retrieval_result.get("metadata", {})
+                    page_number = None
+                    if "x-amz-bedrock-kb-document-page-number" in metadata:
+                        try:
+                            page_number = int(
+                                metadata["x-amz-bedrock-kb-document-page-number"]
+                            )
+                        except (ValueError, TypeError):
+                            pass
+
+                    search_results.append(
+                        SearchResult(
+                            rank=i,
+                            bot_id=bot.id,
+                            content=content,
+                            source_name=source[0],
+                            source_link=source[1],
+                            metadata=metadata,
+                            page_number=page_number,
+                        )
+                    )
         logger.info(f"[END] _bedrock_knowledge_base_search returning search_results={search_results}")
         return search_results
 
@@ -212,6 +243,25 @@ def _bedrock_knowledge_base_search(bot: BotModel, query: str) -> list[SearchResu
 
 def search_related_docs(bot: BotModel, query: str) -> list[SearchResult]:
     logger.info(f"[START] search_related_docs called with bot={bot}, query={query}")
-    results = _bedrock_knowledge_base_search(bot, query)
-    logger.info(f"[END] search_related_docs returning results={results}")
-    return results
+    
+    # Check if bot has Redshift KB
+    if bot.bedrock_knowledge_base and hasattr(bot.bedrock_knowledge_base, 'resource_type') and bot.bedrock_knowledge_base.resource_type == "redshift":
+        logger.info("Using Redshift KB - passing query as plain text")
+        return _bedrock_knowledge_base_search(bot, query)  # This will handle Redshift
+    
+    # Only use custom KB search if there is actual data
+    elif bot.knowledge and (
+        bot.knowledge.source_urls or
+        bot.knowledge.sitemap_urls or
+        bot.knowledge.filenames or
+        bot.knowledge.s3_urls
+    ):
+        logger.info("Diverting to custom KB search (plain text).")
+        # Implement custom KB search function or return empty for now
+        return []
+    
+    # Default to Bedrock KB search
+    else:
+        results = _bedrock_knowledge_base_search(bot, query)
+        logger.info(f"[END] search_related_docs returning results={results}")
+        return results

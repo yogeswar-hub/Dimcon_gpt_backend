@@ -55,7 +55,21 @@ class BotUpdateError(Exception):
 def store_bot(custom_bot: BotModel):
     table = get_bot_table_client()
     logger.info(f"Storing bot: {custom_bot}")
-
+    
+    # Add logging for knowledge base type
+    if custom_bot.bedrock_knowledge_base:
+        kb_type = getattr(custom_bot.bedrock_knowledge_base, 'resource_type', 'bedrock')
+        logger.info(f"[store_bot] Bot '{custom_bot.id}' has Bedrock Knowledge Base (type: {kb_type})")
+    elif (
+        custom_bot.knowledge.source_urls or
+        custom_bot.knowledge.sitemap_urls or
+        custom_bot.knowledge.filenames or
+        custom_bot.knowledge.s3_urls
+    ):
+        logger.info(f"[store_bot] Bot '{custom_bot.id}' has custom Knowledge Base")
+    else:
+        logger.info(f"[store_bot] Bot '{custom_bot.id}' has no knowledge base")
+    
     item = {
         "PK": custom_bot.owner_user_id,
         "SK": compose_sk(custom_bot.id, "bot"),
@@ -122,9 +136,6 @@ def update_bot(
     bedrock_knowledge_base: BedrockKnowledgeBaseModel | None = None,
     bedrock_guardrails: BedrockGuardrailsModel | None = None,
 ):
-    """Update bot title, description, and instruction.
-    NOTE: Use `update_bot_shared_status` to update visibility.
-    """
     table = get_bot_table_client()
     logger.info(f"Updating bot: {bot_id}")
 
@@ -397,7 +408,6 @@ def update_bot_shared_status(
     allowed_user_ids: list[str],
     allowed_group_ids: list[str],
 ):
-    """Update shared status for bot."""
     table = get_bot_table_client()
     logger.info(f"Updating shared status for bot: {bot_id}")
 
@@ -434,7 +444,6 @@ def update_bot_shared_status(
 def update_alias_is_origin_accessible(
     user_id: str, original_bot_id: str, is_origin_accessible: bool
 ):
-    """Update is_origin_accessible for alias."""
     table = get_bot_table_client()
     logger.info(f"Updating is_origin_accessible for alias: {original_bot_id}")
     try:
@@ -756,6 +765,20 @@ def find_bot_by_id(bot_id: str) -> BotModel:
         ),
     )
 
+    # Add logging for knowledge base type when loading bot
+    if bot.bedrock_knowledge_base:
+        kb_type = getattr(bot.bedrock_knowledge_base, 'resource_type', 'bedrock')
+        logger.info(f"[find_bot_by_id] Bot '{bot.id}' loaded with Bedrock Knowledge Base (type: {kb_type})")
+    elif (
+        bot.knowledge.source_urls or
+        bot.knowledge.sitemap_urls or
+        bot.knowledge.filenames or
+        bot.knowledge.s3_urls
+    ):
+        logger.info(f"[find_bot_by_id] Bot '{bot.id}' loaded with custom Knowledge Base")
+    else:
+        logger.info(f"[find_bot_by_id] Bot '{bot.id}' loaded with no knowledge base")
+
     logger.info(f"Found bot: {bot}")
     return bot
 
@@ -988,4 +1011,5 @@ def find_all_published_bots(
             json.dumps(response["LastEvaluatedKey"]).encode("utf-8")
         ).decode("utf-8")
 
+    logger.info(f"Found all published {len(bots)} bots.")
     return bots, next_token
