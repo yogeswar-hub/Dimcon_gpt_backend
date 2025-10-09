@@ -24,6 +24,7 @@ boto3-stubs = {extras = ["bedrock", "bedrock-agent-runtime", "bedrock-runtime", 
 firecrawl-py = "^1.11.1"
 reretry = "^0.11.8"
 requests-oauthlib = "^2.0.0"
+pandas = "^2.2.2"  # <-- Add this line
 
 [tool.poetry.group.dev.dependencies]
 mypy = "^1.15.0"

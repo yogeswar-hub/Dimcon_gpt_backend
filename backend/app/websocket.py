@@ -10,12 +10,6 @@ from typing import BinaryIO, Literal, TypedDict
 import boto3
 from app.agents.tools.agent_tool import ToolRunResult
 from app.auth import verify_token
-from app.charting import (
-    USE_AI_FOR_CHARTS,
-    generate_chart_spec,
-    suiteql_items_to_text_for_chart,
-    wrap_chartjs_message,
-)
 from app.repositories.conversation import RecordNotFoundError
 from app.routes.schemas.conversation import ChatInput
 from app.stream import OnStopInput, OnThinking
@@ -82,7 +76,14 @@ class NotificationSender:
                     )
                     break
                 except Exception as e:
+                    # Log the error but don't send it to client
                     logger.exception(f"Failed to send notification: {e}")
+                    # FILTER OUT TIMEOUT ERRORS - Don't send to client
+                    error_message = str(e).lower()
+                    if "timeout" not in error_message and "endpoint request" not in error_message:
+                        # Only log non-timeout errors, don't send any error notifications
+                        pass
+                    # Just continue to next message without sending error to client
 
             elif command["type"] == "finish":
                 break
@@ -232,10 +233,23 @@ def handler(event, context):
 
     try:
         if step == "SUITEQL":
+            websocket_start_time = time.time()
+            logger.info(f"[TIMING] WebSocket SUITEQL handler started at {websocket_start_time * 1000:.3f}ms")
+            
             nlq = body.get("nlq")
+            if not nlq:
+                logger.error("No NLQ provided in request body.")
+                notificator.notify(json.dumps({
+                    "status": "ERROR",
+                    "message": "Please provide a valid query. Try asking something like 'show me sales orders from last month' or 'list all customers'.",
+                    "timestamp": time.time() * 1000
+                }).encode("utf-8"))
+                return {"statusCode": 400, "body": json.dumps({"error": "Please provide a valid query to process."})}
+
             logger.info(f"SuiteQL route called with NLQ: {nlq}")
 
             # Store connectionId in DynamoDB for this SuiteQL session
+            db_start = time.time()
             table.put_item(
                 Item={
                     "ConnectionId": connection_id,
@@ -245,79 +259,54 @@ def handler(event, context):
                     "expire": expire,
                 }
             )
-            logger.info(f"Stored connectionId {connection_id} for SUITEQL step.")
+            db_time = (time.time() - db_start) * 1000
+            logger.info(f"[TIMING] DynamoDB storage completed in {db_time:.3f}ms for connectionId {connection_id}")
 
+            # Initial processing notification
+            notification_start = time.time()
             notificator.notify(json.dumps({
-                "status": "PROCESSING",
-                "message": "Processing SuiteQL query..."
+                "status": "PROCESSING_START",
+                "message": "Starting data processing pipeline...",
+                "timestamp": notification_start * 1000
             }).encode("utf-8"))
+            notification_time = (time.time() - notification_start) * 1000
+            logger.info(f"[TIMING] Initial processing notification sent in {notification_time:.3f}ms")
 
-            result = process_nl2sql_query(nlq)
+            # Main processing
+            processing_start = time.time()
+            result = process_nl2sql_query(nlq, notificator=notificator)
+            processing_time = (time.time() - processing_start) * 1000
+            
+            logger.info(f"[TIMING] Main processing completed in {processing_time:.3f}ms")
             logger.info(
                 "SuiteQL detailed result: %s",
                 json.dumps(result, indent=2, default=_json_default),
             )
 
-            if "error" in result:
+            # Check if there was a complete failure (no data at all)
+            if "error" in result and not result.get("result"):
                 error_payload = {
                     "status": "ERROR",
                     "nlq": nlq,
                     "error": result["error"],
-                    "message": "SuiteQL query failed.",
+                    "message": "We couldn't process your request right now. Please try rephrasing your question or contact support if the issue continues.",
+                    "processing_time_ms": processing_time,
+                    "timestamp": time.time() * 1000
                 }
+                
+                error_notification_start = time.time()
                 notificator.notify(json.dumps(error_payload, default=_json_default).encode("utf-8"))
+                error_notification_time = (time.time() - error_notification_start) * 1000
+                
+                logger.warning(f"[TIMING] Error notification sent in {error_notification_time:.3f}ms")
                 logger.warning(f"SuiteQL error returned to client: {result['error']}")
                 return {"statusCode": 500, "body": json.dumps(error_payload)}
 
+            # Extract data even if some stages failed
             items = result.get("result", {}).get("items", []) or []
-            text_for_chart = suiteql_items_to_text_for_chart(items)
-
-            # Detect requested chart type from NLQ
-            requested_type = None
-            for chart_type in [
-                "bar", "line", "pie", "doughnut", "radar", "area", "scatter", "bubble",
-                "radialBar", "matrix", "treemap", "sunburst", "candlestick", "ohlc", "wordcloud"
-            ]:
-                if chart_type in (nlq or "").lower():
-                    requested_type = chart_type
-                    break
-
-            chart_specs = []
-            used_types = set()
-
-            if items and text_for_chart and len(text_for_chart.strip()) > 0:
-                # First chart: user requested type (if any)
-                if requested_type:
-                    try:
-                        chart_spec = generate_chart_spec(text_for_chart, preferred_type=requested_type)
-                        if chart_spec and chart_spec.get("type"):
-                            chart_specs.append(chart_spec)
-                            used_types.add(chart_spec["type"])
-                    except Exception as e:
-                        logger.warning(f"Chart generation failed for requested type {requested_type}: {e}")
-
-                # Next two charts: AI picks best types, but avoid duplicates
-                ai_types = [t for t in [
-                    "bar", "line", "pie", "doughnut", "radar", "area", "scatter", "bubble",
-                    "radialBar", "matrix", "treemap", "sunburst", "candlestick", "ohlc", "wordcloud"
-                ] if t not in used_types]
-                for _ in range(3 - len(chart_specs)):
-                    for ai_type in ai_types:
-                        try:
-                            chart_spec = generate_chart_spec(text_for_chart, preferred_type=ai_type)
-                            if chart_spec and chart_spec.get("type") and chart_spec["type"] not in used_types:
-                                chart_specs.append(chart_spec)
-                                used_types.add(chart_spec["type"])
-                                break
-                        except Exception as e:
-                            logger.warning(f"Chart generation failed for AI type {ai_type}: {e}")
-
-                # Pad with None if less than 3 charts
-                while len(chart_specs) < 3:
-                    chart_specs.append(None)
-            else:
-                chart_specs = []  # No charts if no informative data
-
+            
+            # Build final notification payload (do NOT send SUITEQL_RESULT notification)
+            final_notification_start = time.time()
             notification_payload = {
                 "status": "SUITEQL_RESULT",
                 "nlq": nlq,
@@ -327,12 +316,30 @@ def handler(event, context):
                     "totalResults": len(items),
                 },
                 "summary": result.get("summary"),
-                "message": f"SuiteQL query processed. Showing all {len(items)} records.",
-                "chart_specs": chart_specs
+                "chart_specs": result.get("chart_specs", []),
+                "message": f"Successfully found {len(items)} record{'s' if len(items) != 1 else ''} matching your request.",
+                "errors": result.get("errors", {}),
+                "partial_success": len(result.get("errors", {})) > 0,
+                "processing_time_ms": processing_time,
+                "timestamp": final_notification_start * 1000,
+                "timing": result.get("timing", {})
             }
 
-            notificator.notify(json.dumps(notification_payload, default=_json_default).encode("utf-8"))
+            # Add warning if some stages failed
+            if result.get("errors"):
+                failed_stages = list(result["errors"].keys())
+                notification_payload["warning"] = f"Some processing stages failed: {', '.join(failed_stages)}"
+
+            final_notification_time = (time.time() - final_notification_start) * 1000
+            websocket_total_time = (time.time() - websocket_start_time) * 1000
+            
+            logger.info(f"[TIMING] Final result notification sent in {final_notification_time:.3f}ms")
+            logger.info(f"[TIMING] Total WebSocket handler time: {websocket_total_time:.3f}ms")
             logger.info("SuiteQL result notification sent.")
+            
+            # REMOVED: notificator.notify(json.dumps(notification_payload, default=_json_default).encode("utf-8"))
+            # Do not send SUITEQL_RESULT notification
+
             return {"statusCode": 200, "body": "SuiteQL processed."}
 
         if step == "START":

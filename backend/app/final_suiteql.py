@@ -5,9 +5,11 @@ import time
 import logging
 import boto3
 import re
-
+import pandas as pd
+from datetime import datetime
 from requests_oauthlib import OAuth1
 from dotenv import load_dotenv
+from app.prompts import SYSTEM_PROMPT, SUMMARIZATION_PROMPT, URL_GENERATION_PROMPT
 
 logging.basicConfig(level=logging.INFO)
 
@@ -23,488 +25,591 @@ TOKEN_SECRET = os.getenv("NETSUITE_TOKEN_SECRET")
 # ===== Bedrock CONFIG =====
 BEDROCK_REGION = "us-east-1"
 KB_ID = "VRQ5QNZEW6"
+INFERENCE_PROFILE_ARN = (
+    "arn:aws:bedrock:us-east-1::inference-profile/"
+    "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+)
 
-# Cross-region inference profile ARN
-INFERENCE_PROFILE_ARN = "arn:aws:bedrock:us-east-1::inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0"
-
-# ===== Setup Auth for NetSuite SuiteQL API =====
+# ===== NetSuite Auth =====
 auth = OAuth1(
     CONSUMER_KEY,
     CONSUMER_SECRET,
     TOKEN_ID,
     TOKEN_SECRET,
-    signature_method='HMAC-SHA256',
+    signature_method="HMAC-SHA256",
     realm=ACCOUNT_ID,
-    signature_type='AUTH_HEADER'
+    signature_type="AUTH_HEADER",
 )
 
-# ===== Initialize AWS Bedrock clients =====
+# ===== Bedrock Clients =====
 bedrock_agent = boto3.client("bedrock-agent-runtime", region_name=BEDROCK_REGION)
 bedrock_runtime = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
 
-SYSTEM_PROMPT = """You are an expert NetSuite SuiteQL query generator. Your role is to translate natural language queries into valid, executable SuiteQL statements using the NetSuite schema provided in the knowledge base context.
+# ===== Cache =====
+URL_COMPONENT_CACHE = {}
 
-## Core Output Requirements
-
-1. **Output Format**: Return ONLY the raw SQL query with no additional text, explanations, or formatting
-2. **No Markdown**: Do NOT use code blocks, backticks, or ```sql markers
-3. **No Comments**: Do not include SQL comments, formatting notes, or explanatory text
-4. **Direct Execution**: The output must be immediately executable by the SuiteQL API
-
-## Schema Adherence Rules
-
-1. **Strict Schema Compliance**: Use ONLY table names, field names (internal IDs), and relationships explicitly defined in the provided schema
-2. **No Hallucination**: Never invent or assume table names, field names, or relationships not present in the schema
-3. **Exact Field Names**: Use the exact internal ID field names as specified in the schema documentation
-4. **No Custom Fields**: Do not add or reference custom fields unless explicitly present in the schema
-5. **Schema Validation**: If a requested field or table doesn't exist, use the closest valid alternative from the schema
-
-## NetSuite Transaction Records - CRITICAL
-
-NetSuite uses a unified `transaction` table for all transaction types. Follow these rules strictly:
-
-1. **Single Table**: ALL transaction types (invoices, sales orders, purchase orders, vendor bills, cash sales, credit memos, etc.) are stored in the `transaction` table
-2. **Record Type Filtering**: Filter by `recordtype = '<VALUE>'` to query specific transaction types
-3. **Valid Record Types**: Use ONLY the recordtype values defined in `transaction_recordtypes.jsonl` from the knowledge base
-4. **No Separate Tables**: NEVER use `FROM invoice`, `FROM salesorder`, or similar - ALWAYS use `FROM transaction`
-
-Examples:
-- For invoices: `SELECT * FROM transaction WHERE recordtype = 'invoice'`
-- For sales orders: `SELECT * FROM transaction WHERE recordtype = 'salesorder'`
-- For vendor bills: `SELECT * FROM transaction WHERE recordtype = 'vendorbill'`
-
-## SuiteQL Syntax Requirements
-
-1. **No LIMIT Clause**: Do not use LIMIT in queries
-2. **No MySQL Syntax**: Avoid MySQL-specific syntax like backticks (`)
-3. **Proper Joins**: Use explicit JOIN syntax with proper ON conditions
-4. **Date Handling**: Use NetSuite's date functions and formats
-5. **Case Sensitivity**: Follow NetSuite's case requirements for keywords and identifiers
-
-## Error Handling and Retry Logic
-
-When an error is provided:
-
-1. **Analyze the Error**: Carefully review the error message to identify the root cause
-2. **Generate Different Query**: Create a DIFFERENT SQL query that addresses the specific error
-3. **Alternative Approaches**: Try alternative table structures, field names, or join strategies
-4. **Progressive Simplification**: If complex queries fail, try simpler alternatives
-5. **Never Repeat**: Do not return the same query that caused the error
-6. **Schema Validation**: Cross-reference with the schema to ensure all elements exist
-
-## Query Construction Best Practices
-
-1. **Start Simple**: Begin with basic queries and add complexity only as needed
-2. **Qualify Columns**: Use table aliases and qualified column names for clarity
-3. **Proper Aliasing**: Use meaningful aliases for tables and derived columns
-4. **Aggregation**: Use appropriate GROUP BY clauses when using aggregate functions
-5. **Subqueries**: Use subqueries when necessary but prefer JOINs when possible
-6. **NULL Handling**: Consider NULL values in WHERE clauses and JOINs
-
-## Common NetSuite Patterns
-
-1. **Customer Queries**: Join transaction table with customer/entity tables using entity_id
-2. **Item Queries**: Join transaction lines with item table using item_id
-3. **Date Ranges**: Use BETWEEN or >= AND <= for date filtering
-4. **Status Filters**: Many records have status fields - check schema for valid values
-5. **Subsidiary Filtering**: Multi-subsidiary accounts need subsidiary filters
-
-## Quality Checklist
-
-Before outputting your query, verify:
-- [ ] All table names exist in the schema
-- [ ] All field names match schema internal IDs exactly
-- [ ] Transaction queries use `transaction` table with proper recordtype filter
-- [ ] No markdown formatting or code blocks
-- [ ] No LIMIT clause
-- [ ] Proper JOIN conditions
-- [ ] Valid SuiteQL syntax
-- [ ] Query addresses the natural language request accurately
-
-Remember: Your output should be production-ready SQL that can execute immediately without any modifications."""
-
-SUMMARIZATION_PROMPT = """You are a data analysis assistant. Your task is to analyze NetSuite query results and provide clear, actionable summaries.
-
-When given query results with aggregated statistics and sample data, you should:
-1. Present the TOTAL statistics prominently (covering ALL records, not just the sample)
-2. Identify key insights and patterns across the entire dataset
-3. Provide meaningful breakdowns and distributions
-4. Highlight important findings or anomalies
-5. Present information in a clear, business-friendly format using tables or structured formatting
-
-The statistics provided cover the ENTIRE dataset. Use these to give a comprehensive overview.
-Be concise but comprehensive. Focus on what matters to business users."""
-
+# ==========================================================
+# === KNOWLEDGE BASE RETRIEVAL ===
+# ==========================================================
 def retrieve_from_kb(query: str, num_results: int = 5) -> str:
-    """Retrieve relevant schema documents from Knowledge Base"""
     response = bedrock_agent.retrieve(
         knowledgeBaseId=KB_ID,
-        retrievalQuery={'text': query},
+        retrievalQuery={"text": query},
         retrievalConfiguration={
-            'vectorSearchConfiguration': {
-                'numberOfResults': num_results
-            }
-        }
+            "vectorSearchConfiguration": {"numberOfResults": num_results}
+        },
     )
-    
-    # Combine all retrieved content
-    context_parts = []
-    for result in response.get('retrievalResults', []):
-        context_parts.append(result['content']['text'])
-    
+    context_parts = [r["content"]["text"] for r in response.get("retrievalResults", [])]
     return "\n\n".join(context_parts)
 
-def clean_sql_query(sql_query: str) -> str:
-    """Remove markdown code blocks and extra formatting from SQL query"""
-    # Remove ```sql and ``` markers
-    sql_query = re.sub(r'^```sql\s*\n?', '', sql_query, flags=re.IGNORECASE)
-    sql_query = re.sub(r'^```\s*\n?', '', sql_query)
-    sql_query = re.sub(r'\n?```\s*$', '', sql_query)
-    
-    # Strip whitespace
-    sql_query = sql_query.strip()
-    
-    return sql_query
 
-def analyze_data_statistics(items: list) -> dict:
-    """Analyze all records and compute comprehensive statistics"""
-    logging.info(f"[final_suiteql] Analyzing {len(items)} records for statistics.")
+# ==========================================================
+# === SQL CLEANUP ===
+# ==========================================================
+def clean_sql_query(sql_query: str) -> str:
+    sql_query = re.sub(r"^```sql\s*\n?", "", sql_query, flags=re.IGNORECASE)
+    sql_query = re.sub(r"^```\s*\n?", "", sql_query)
+    sql_query = re.sub(r"\n?```\s*$", "", sql_query)
+    return sql_query.strip()
+
+
+# ==========================================================
+# === RECORD TYPE DETECTION - ENHANCED ===
+# ==========================================================
+def detect_record_type(sql_query: str, item: dict) -> tuple:
+    """
+    Detect the record type and source table from the SQL query and result item.
+    Returns: (record_type, table_name)
     
+    Strategy: Analyze the SELECT clause to determine which table the ID field comes from.
+    The first table with an ID field in SELECT takes priority.
+    """
+    # If recordtype field exists in the result, use it (for transaction table)
+    if "recordtype" in item:
+        return (item["recordtype"].lower(), "transaction")
+    
+    sql_lower = sql_query.lower()
+    
+    # Extract SELECT clause
+    select_match = re.search(r"select\s+(.*?)\s+from", sql_lower, re.DOTALL)
+    if select_match:
+        select_clause = select_match.group(1)
+        
+        # Look for patterns like: alias.fieldname AS id
+        # This handles cases like: tl.item AS id, c.customerid AS id, etc.
+        aliased_id_match = re.search(r"(\w+)\.(\w+)\s+as\s+id", select_clause)
+        if aliased_id_match:
+            alias = aliased_id_match.group(1)
+            field_name = aliased_id_match.group(2)
+            
+            # Common field name to table mappings
+            field_to_table = {
+                'item': 'item',
+                'customer': 'customer',
+                'entity': 'customer',  # entity often refers to customer
+                'vendor': 'vendor',
+                'employee': 'employee',
+                'account': 'account',
+                'department': 'department',
+                'class': 'class',
+                'location': 'location',
+                'subsidiary': 'subsidiary',
+            }
+            
+            # Check if field name indicates a specific table
+            if field_name in field_to_table:
+                return (field_to_table[field_name], field_to_table[field_name])
+            
+            # Otherwise, try to find what table the alias refers to
+            from_pattern = rf"from\s+(\w+)(?:\s+as)?\s+{alias}\b"
+            from_match = re.search(from_pattern, sql_lower)
+            if from_match:
+                table_name = from_match.group(1)
+                return (table_name, table_name)
+            
+            join_pattern = rf"join\s+(\w+)(?:\s+as)?\s+{alias}\b"
+            join_match = re.search(join_pattern, sql_lower)
+            if join_match:
+                table_name = join_match.group(1)
+                return (table_name, table_name)
+        
+        # Look for aliased id field (e.g., "c.id", "i.id", "t.id")
+        # Find the FIRST occurrence - this is the primary record type
+        id_alias_match = re.search(r"(\w+)\.id(?:\s|,|$)", select_clause)
+        if id_alias_match:
+            alias = id_alias_match.group(1)
+            
+            # Now find what table this alias refers to
+            # Pattern 1: FROM table alias or FROM table AS alias
+            from_pattern = rf"from\s+(\w+)(?:\s+as)?\s+{alias}\b"
+            from_match = re.search(from_pattern, sql_lower)
+            if from_match:
+                table_name = from_match.group(1)
+                # Special check: if this is transaction table, check for recordtype
+                if table_name == "transaction":
+                    recordtype_match = re.search(r"recordtype\s*=\s*['\"](\w+)['\"]", sql_lower)
+                    if recordtype_match:
+                        return (recordtype_match.group(1), "transaction")
+                    return ("transaction", "transaction")
+                return (table_name, table_name)
+            
+            # Pattern 2: JOIN table alias or JOIN table AS alias
+            join_pattern = rf"join\s+(\w+)(?:\s+as)?\s+{alias}\b"
+            join_match = re.search(join_pattern, sql_lower)
+            if join_match:
+                table_name = join_match.group(1)
+                # For JOINs, still check if it's transaction with recordtype
+                if table_name == "transaction":
+                    recordtype_match = re.search(r"recordtype\s*=\s*['\"](\w+)['\"]", sql_lower)
+                    if recordtype_match:
+                        return (recordtype_match.group(1), "transaction")
+                return (table_name, table_name)
+        
+        # Look for unaliased id field in SELECT
+        if re.search(r"\bid\b", select_clause):
+            # Find the main table in FROM clause (first table mentioned)
+            from_match = re.search(r"from\s+(\w+)", sql_lower)
+            if from_match:
+                table_name = from_match.group(1)
+                # Special handling for transaction table
+                if table_name == "transaction":
+                    # Look for recordtype in WHERE clause
+                    recordtype_where = re.search(r"recordtype\s*(?:=|in)\s*[('\"](\w+)", sql_lower)
+                    if recordtype_where:
+                        return (recordtype_where.group(1), "transaction")
+                    return ("transaction", "transaction")
+                return (table_name, table_name)
+    
+    # Fallback: Extract the main table from FROM clause
+    from_match = re.search(r"from\s+(\w+)", sql_lower)
+    if from_match:
+        table_name = from_match.group(1)
+        return (table_name, table_name)
+    
+    return (None, None)
+
+
+# ==========================================================
+# === LLM: URL COMPONENT RETRIEVAL - ENHANCED ===
+# ==========================================================
+def get_url_components_from_llm(record_type: str, table_name: str = None) -> dict:
+    """
+    Get URL components from LLM with enhanced caching and table awareness.
+    """
+    cache_key = f"{table_name}:{record_type}" if table_name else record_type
+    
+    if cache_key in URL_COMPONENT_CACHE:
+        logging.info(f"Using cached URL components for {cache_key}")
+        return URL_COMPONENT_CACHE[cache_key]
+    
+    try:
+        # Construct query based on whether we have a table name
+        if table_name and table_name != record_type:
+            url_query = f"NetSuite URL structure for {record_type} record in {table_name} table"
+        else:
+            url_query = f"NetSuite URL structure for {record_type} record type"
+        
+        url_context = retrieve_from_kb(url_query, num_results=10)
+        
+        user_message = f"""
+Based on the following official NetSuite URL structure documentation:
+
+{url_context}
+
+Determine the correct module, submodule, and record file name (without .nl extension)
+for the record type '{record_type}'{f" from the {table_name} table" if table_name else ""}.
+
+Important context:
+- If this is from the 'item' table, use item URL structure from Module 1
+- If this is from the 'customer' or entity-related table, use entity URL structure from Module 1
+- If this is from the 'transaction' table with recordtype='{record_type}', use transaction URL structure from Module 2
+- If this is from the 'vendor' table, use vendor URL structure from Module 1
+- If this is from the 'employee' table, use employee URL structure from Module 1
+- If this is from the 'account', 'department', 'class', 'location', 'subsidiary' tables, use otherlists URL structure from Module 1
+
+Search the documentation carefully and return the exact URL components.
+
+Return ONLY valid JSON like:
+{{
+  "module": "<module>",
+  "submodule": "<submodule>",
+  "record_file": "<record_file>"
+}}
+"""
+        payload = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 500,
+            "temperature": 0,
+            "system": URL_GENERATION_PROMPT,
+            "messages": [{"role": "user", "content": user_message}],
+        }
+        response = bedrock_runtime.invoke_model(
+            modelId=INFERENCE_PROFILE_ARN,
+            body=json.dumps(payload),
+            contentType="application/json",
+        )
+        response_body = json.loads(response["body"].read())
+        model_output = response_body["content"][0]["text"].strip()
+        
+        # Clean markdown fences
+        model_output = re.sub(
+            r"^```(?:json)?", "", model_output.strip(), flags=re.IGNORECASE
+        )
+        model_output = re.sub(r"```$", "", model_output.strip())
+        model_output = model_output.strip()
+        
+        components = json.loads(model_output)
+        clean_data = {
+            "module": components.get("module", "").strip(),
+            "submodule": components.get("submodule", "").strip(),
+            "record_file": components.get("record_file", "")
+            .replace(".nl", "")
+            .strip(),
+        }
+        
+        URL_COMPONENT_CACHE[cache_key] = clean_data
+        logging.info(f"Cached URL components for {cache_key}: {clean_data}")
+        return clean_data
+        
+    except Exception as e:
+        logging.error(f"Error getting URL components from LLM: {e}")
+        return None
+
+
+# ==========================================================
+# === LOCAL URL CONSTRUCTION ===
+# ==========================================================
+def construct_netsuite_url_from_components(account_id: str, components: dict, record_id: str) -> str:
+    if not components or not all(k in components for k in ("module", "submodule", "record_file")):
+        return None
+    return f"https://{account_id}.app.netsuite.com/app/{components['module']}/{components['submodule']}/{components['record_file']}.nl?id={record_id}"
+
+
+# ==========================================================
+# === ENRICH RESULTS WITH URL - ENHANCED ===
+# ==========================================================
+def enrich_results_with_urls(sql_query: str, results: dict) -> dict:
+    if not results or "items" not in results:
+        return results
+    
+    enriched_items = []
+    total_items = len(results["items"])
+    print(f"\n→ Generating NetSuite URLs for {total_items} records...")
+    
+    success_count = 0
+    
+    # Detect record type once from the first item (they should all be the same type)
+    if results["items"]:
+        first_item = results["items"][0]
+        record_type, table_name = detect_record_type(sql_query, first_item)
+        logging.info(f"Detected record_type='{record_type}', table_name='{table_name}' from SQL query")
+        
+        if record_type and table_name:
+            # Get URL components once for all records
+            components = get_url_components_from_llm(record_type, table_name)
+            
+            if components:
+                logging.info(f"URL components for {table_name}: {components}")
+                
+                # Apply to all records
+                for idx, item in enumerate(results["items"], 1):
+                    enriched_item = {}
+                    record_id = item.get("id") or item.get("internalid")
+                    
+                    # Copy all fields except 'links' and convert keys to camelCase
+                    for key, value in item.items():
+                        if key == "links":
+                            continue  # Skip links field
+                        # Convert snake_case to camelCase
+                        camel_key = re.sub(r'_([a-z])', lambda m: m.group(1).upper(), key)
+                        enriched_item[camel_key] = value
+                    
+                    # Add URL if we have an ID
+                    if record_id:
+                        url = construct_netsuite_url_from_components(ACCOUNT_ID, components, record_id)
+                        if url:
+                            enriched_item["netsuiteUrl"] = url
+                            success_count += 1
+                    
+                    enriched_items.append(enriched_item)
+                    
+                    if total_items > 10 and idx % 10 == 0:
+                        print(f"  Progress: {idx}/{total_items} URLs generated...")
+            else:
+                logging.error(f"Failed to get URL components for record_type={record_type}, table={table_name}")
+                enriched_items = results["items"]
+        else:
+            logging.error(f"Could not detect record type from SQL query")
+            enriched_items = results["items"]
+    
+    results["items"] = enriched_items
+    print(f"✓ Successfully generated {success_count} NetSuite URLs")
+    return results
+
+
+# ==========================================================
+# === DATA ANALYSIS / STATISTICS ===
+# ==========================================================
+def analyze_data_statistics(items: list) -> dict:
     if not items:
         return {"total_records": 0}
     
     stats = {
         "total_records": len(items),
-        "field_analysis": {},
         "numeric_fields": {},
-        "date_fields": {},
-        "categorical_fields": {}
+        "categorical_fields": {},
+        "url_count": sum(1 for i in items if "netsuite_url" in i),
     }
     
-    # Get all unique fields
-    all_fields = set()
-    for item in items:
-        all_fields.update(item.keys())
+    all_fields = set(k for item in items for k in item.keys() if k != "netsuite_url")
     
-    # Analyze each field
     for field in all_fields:
         values = [item.get(field) for item in items if item.get(field) is not None]
-        
         if not values:
             continue
         
-        # Skip if values contain lists or dicts (complex types)
-        if any(isinstance(v, (list, dict)) for v in values):
-            continue
-            
-        # Check if numeric
         try:
-            numeric_values = [float(v) for v in values if v != '' and v is not None]
-            if numeric_values and len(numeric_values) > 0:
+            numeric_values = [float(v) for v in values if str(v).replace(".", "", 1).replace("-", "", 1).isdigit()]
+            if numeric_values:
                 stats["numeric_fields"][field] = {
                     "count": len(numeric_values),
                     "sum": round(sum(numeric_values), 2),
                     "avg": round(sum(numeric_values) / len(numeric_values), 2),
                     "min": round(min(numeric_values), 2),
-                    "max": round(max(numeric_values), 2)
+                    "max": round(max(numeric_values), 2),
                 }
-        except (ValueError, TypeError):
-            pass
-        
-        # Check if categorical (limited unique values)
-        # Filter out complex types before creating set
-        simple_values = [v for v in values if not isinstance(v, (list, dict))]
-        try:
-            unique_values = list(set(simple_values))
-            if len(unique_values) <= 20:  # Reasonable number for categories
-                value_counts = {}
-                for v in simple_values:
-                    str_v = str(v)  # Convert to string for consistent keys
-                    value_counts[str_v] = value_counts.get(str_v, 0) + 1
+            elif len(set(values)) <= 20:
+                value_counts = {str(v): values.count(v) for v in set(values)}
                 stats["categorical_fields"][field] = value_counts
-        except TypeError:
-            # Skip fields that still can't be processed
+        except Exception:
             continue
     
     return stats
 
-def create_smart_sample(items: list, sample_size: int = 30) -> list:
-    """Create a representative sample from all records"""
-    
-    if len(items) <= sample_size:
-        return items
-    
-    # Take records from beginning, middle, and end
-    step = len(items) // sample_size
-    sample = []
-    
-    for i in range(0, len(items), step):
-        if len(sample) < sample_size:
-            sample.append(items[i])
-    
-    return sample
 
+# ==========================================================
+# === SQL GENERATION ===
+# ==========================================================
 def generate_sql_with_cross_region(user_query: str, schema_context: str, error_context: str = None) -> str:
-    """Generate SQL using cross-region inference profile"""
-    
-    if error_context:
-        user_message = f"""Schema information from NetSuite knowledge base:
+    message = f"""Schema from KB:
 
 {schema_context}
 
-Natural language query: {user_query}
+User Query: {user_query}
 
-Previous SQL query resulted in this error:
-{error_context}
-
-Please generate a DIFFERENT SQL query that avoids this error. Try a different approach or simplification.
-Generate only the SQL query with no explanation, no markdown code blocks, and no additional text."""
-    else:
-        user_message = f"""Schema information from NetSuite knowledge base:
-
-{schema_context}
-
-Natural language query: {user_query}
-
-Generate only the SQL query with no explanation, no markdown code blocks, and no additional text."""
+{f'Error previously: {error_context}' if error_context else ''}
+Always include id field. For transaction queries, include recordtype field. Return only SQL."""
     
     payload = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 2000,
-        "temperature": 0.3 if error_context else 0,
+        "temperature": 0.2,
         "system": SYSTEM_PROMPT,
-        "messages": [
-            {
-                "role": "user",
-                "content": user_message
-            }
-        ]
+        "messages": [{"role": "user", "content": message}],
     }
     
     response = bedrock_runtime.invoke_model(
         modelId=INFERENCE_PROFILE_ARN,
         body=json.dumps(payload),
-        contentType="application/json"
+        contentType="application/json",
     )
-    
-    response_body = json.loads(response["body"].read())
-    raw_sql = response_body["content"][0]["text"].strip()
-    
-    # Clean the SQL query
-    cleaned_sql = clean_sql_query(raw_sql)
-    
-    return cleaned_sql
+    body = json.loads(response["body"].read())
+    return clean_sql_query(body["content"][0]["text"].strip())
 
-def summarize_results(natural_query: str, sql_query: str, results: dict) -> str:
-    """Summarize ALL query results using Claude with comprehensive statistics"""
-    logging.info(f"[final_suiteql] Summarizing results for NLQ: {natural_query}")
-    items = results.get('items', [])
-    total_count = len(items)
-    logging.info(f"[final_suiteql] Total records to summarize: {total_count}")
-    
-    if total_count == 0:
-        return "No records found matching your query."
-    
-    # Analyze ALL records for statistics
-    print("\n→ Analyzing all records for comprehensive statistics...")
-    statistics = analyze_data_statistics(items)
-    
-    # Create a smart sample for context
-    sample_items = create_smart_sample(items, sample_size=30)
-    
-    user_message = f"""Natural Language Query: {natural_query}
 
-SQL Query Executed:
+# ==========================================================
+# === SUITEQL EXECUTION ===
+# ==========================================================
+def run_suiteql_query(sql_query: str):
+    url = f"https://{ACCOUNT_ID}.suitetalk.api.netsuite.com/services/rest/query/v1/suiteql"
+    headers = {"Content-Type": "application/json", "Prefer": "transient"}
+    try:
+        r = requests.post(url, auth=auth, headers=headers, json={"q": sql_query})
+        if r.status_code == 200:
+            return {"success": True, "data": r.json()}
+        return {"success": False, "error": f"{r.status_code}: {r.text}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ==========================================================
+# === RETRY LOGIC ===
+# ==========================================================
+def process_query_with_retry(nlq: str, max_attempts: int = 5, notificator=None):
+    attempted = []
+    error_context = None
+
+    for attempt in range(1, max_attempts + 1):
+        # Professional attempt start message
+        if notificator:
+            notificator.notify(json.dumps({
+                "status": "ATTEMPT_START",
+                "attempt": attempt,
+                "message": f"Processing attempt {attempt} of {max_attempts} - Analyzing your query and preparing data..."
+            }).encode("utf-8"))
+
+        print(f"\n{'='*60}\nAttempt {attempt}/{max_attempts}\n{'='*60}")
+
+        schema = retrieve_from_kb(nlq)
+        sql = generate_sql_with_cross_region(nlq, schema, error_context)
+        # Format SQL as single line
+        sql_single_line = " ".join(sql.split())
+
+        if sql_single_line in attempted:
+            print("⚠️ Duplicate SQL generated, skipping...")
+            continue
+
+        attempted.append(sql_single_line)
+        print(f"\n✓ Generated SQL:\n{sql_single_line}\n")
+        result = run_suiteql_query(sql_single_line)
+
+        if result["success"]:
+            enriched = enrich_results_with_urls(sql_single_line, result["data"])
+            return {"success": True, "sql": sql_single_line, "nlq": nlq, "data": enriched}
+        else:
+            error_context = result["error"]
+            print(f"✗ Query failed: {error_context}")
+            
+            # Professional failure message
+            if notificator:
+                notificator.notify(json.dumps({
+                    "status": "ATTEMPT_FAILED",
+                    "attempt": attempt,
+                    "message": f"Attempt {attempt} unsuccessful - Trying alternative approach {attempt + 1}...",
+                    "sql_query": sql_single_line,
+                    "error": error_context
+                }).encode("utf-8"))
+    # ...existing code...
+
+    # Professional final failure message
+    if notificator:
+        notificator.notify(json.dumps({
+            "status": "ALL_ATTEMPTS_FAILED",
+            "message": "Unable to retrieve the requested data after multiple attempts. Please try rephrasing your question or verify the data exists in NetSuite."
+        }).encode("utf-8"))
+
+    return {"success": False, "message": "Unable to fetch the information for your query."}
+
+
+# ==========================================================
+# === SUMMARY (LLM + Statistics) - STRUCTURED JSON ===
+# ==========================================================
+def summarize_results(nlq: str, sql_query: str, results: dict):
+    items = results.get("items", [])
+    if not items:
+        return json.dumps({"error": "No records found"})
+    
+    stats = analyze_data_statistics(items)
+    sample = items[:10]
+    
+    message = f"""
+Natural Query: {nlq}
+
+SQL Query:
 {sql_query}
 
-COMPLETE DATASET STATISTICS (covering ALL {total_count} records):
-{json.dumps(statistics, indent=2)}
+Dataset Statistics:
+{json.dumps(stats, indent=2)}
 
-Representative Sample Data ({len(sample_items)} records from across the dataset):
-{json.dumps(sample_items, indent=2)}
+Sample Records:
+{json.dumps(sample, indent=2)}
 
-IMPORTANT: The statistics above cover ALL {total_count} records. Please provide a comprehensive summary of the ENTIRE dataset, not just the sample. Focus on:
+Provide a business summary in exactly 200 words or less. Return ONLY valid JSON with this structure:
 
-1. Overall summary of all {total_count} records
-2. Key metrics and totals (use the statistics that cover all records)
-3. Distributions and patterns across the complete dataset
-4. Important findings and insights
-5. Any notable anomalies or trends
+{{
+  "summary": "Your 200-word business summary here as a single string with no special characters or line breaks"
+}}
 
-Format your response in a clear, business-friendly way with appropriate structure and emphasis on the COMPLETE dataset."""
+IMPORTANT:
+- Maximum 200 words
+- Single continuous text in the summary field
+- No markdown formatting
+- No special characters like * # - |
+- No line breaks or newlines
+- Plain text only
+- Return ONLY the JSON object
+"""
     
     payload = {
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 3000,
+        "max_tokens": 500,
         "temperature": 0.1,
         "system": SUMMARIZATION_PROMPT,
-        "messages": [
-            {
-                "role": "user",
-                "content": user_message
-            }
-        ]
+        "messages": [{"role": "user", "content": message}],
     }
     
     response = bedrock_runtime.invoke_model(
         modelId=INFERENCE_PROFILE_ARN,
         body=json.dumps(payload),
-        contentType="application/json"
+        contentType="application/json",
     )
+    body = json.loads(response["body"].read())
+    summary_text = body["content"][0]["text"].strip()
     
-    response_body = json.loads(response["body"].read())
-    summary = response_body["content"][0]["text"].strip()
+    # Clean any markdown artifacts
+    summary_text = re.sub(r"```(?:json)?", "", summary_text)
+    summary_text = summary_text.strip()
     
-    return summary
+    # Parse and return JSON
+    try:
+        summary_json = json.loads(summary_text)
+        return json.dumps(summary_json, separators=(',', ':'))  # No spaces
+    except:
+        # Fallback if LLM doesn't return valid JSON
+        return json.dumps({"summary": summary_text.replace('\n', ' ')[:200]}, separators=(',', ':'))
 
-def nlq_to_sql(natural_query: str, error_context: str = None) -> str:
-    """Convert natural language to SQL using KB retrieval + cross-region generation"""
-    logging.info(f"[final_suiteql] Received NLQ: {natural_query}")
-    # Step 1: Retrieve relevant schema from Knowledge Base
-    logging.info("[final_suiteql] Retrieving schema from Knowledge Base...")
-    schema_context = retrieve_from_kb(natural_query)
-    logging.debug(f"[final_suiteql] Retrieved schema context: {schema_context}")
 
-    # Step 2: Generate SQL using cross-region model
-    if error_context:
-        logging.info("[final_suiteql] Regenerating SQL with error context...")
-        logging.debug(f"[final_suiteql] Error context: {error_context}")
-    else:
-        logging.info("[final_suiteql] Generating SQL with cross-region model...")
-
-    sql_query = generate_sql_with_cross_region(natural_query, schema_context, error_context)
-    logging.info(f"[final_suiteql] Generated SQL: {sql_query}")
-
-    return sql_query
-
-def run_suiteql_query(sql_query: str):
-    """Execute SuiteQL query against NetSuite API"""
-    logging.info(f"[final_suiteql] Executing SuiteQL query: {sql_query}")
-    url = f"https://{ACCOUNT_ID}.suitetalk.api.netsuite.com/services/rest/query/v1/suiteql"
-    headers = {
-        "Content-Type": "application/json",
-        "Prefer": "transient"
-    }
-    payload = {"q": sql_query}
-    max_retries = 3
-    backoff_factor = 2
-
-    for attempt in range(max_retries):
-        try:
-            logging.debug(f"[final_suiteql] Attempt {attempt+1}: POST {url} Payload: {payload}")
-            response = requests.post(url, auth=auth, headers=headers, json=payload)
-            logging.debug(f"[final_suiteql] Response status: {response.status_code}, Body: {response.text}")
-            if response.status_code == 200:
-                logging.info("[final_suiteql] SuiteQL query succeeded.")
-                return {"success": True, "data": response.json()}
-            else:
-                error_msg = f"Status {response.status_code}: {response.text}"
-                logging.error(f"[final_suiteql] SuiteQL API error - {error_msg}")
-                return {"success": False, "error": error_msg}
-        except requests.RequestException as e:
-            logging.error(f"[final_suiteql] Request exception: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(backoff_factor ** attempt)
-            else:
-                return {"success": False, "error": str(e)}
-
-    logging.error("[final_suiteql] Max retries exceeded for SuiteQL query.")
-    return {"success": False, "error": "Max retries exceeded"}
-
-def process_query_with_retry(natural_query: str, max_attempts: int = 5):
-    """Process a query with retry logic - maximum 5 attempts"""
-    
-    attempted_queries = []
-    error_context = None
-    
-    for attempt in range(1, max_attempts + 1):
-        print(f"\n{'='*60}")
-        print(f"Attempt {attempt}/{max_attempts}")
-        print(f"{'='*60}")
-        
-        # Generate SQL
-        sql_query = nlq_to_sql(natural_query, error_context)
-        
-        # Check if we've already tried this exact query
-        if sql_query in attempted_queries:
-            print(f"\n⚠️  Warning: Generated the same SQL query as before. Skipping...")
-            continue
-        
-        attempted_queries.append(sql_query)
-        
-        print(f"\n✓ Generated SQL (Attempt {attempt}):")
-        print(sql_query)
-        
-        # Execute SQL
-        print(f"\n→ Running SuiteQL query...")
-        result = run_suiteql_query(sql_query)
-        
-        if result["success"]:
-            return {"success": True, "data": result["data"], "sql": sql_query, "natural_query": natural_query}
-        else:
-            error_context = result["error"]
-            print(f"\n✗ Query failed: {error_context}")
-            
-            if attempt < max_attempts:
-                print(f"\n→ Retrying with error context...")
-    
-    # After 5 attempts, return failure
-    return {"success": False, "message": "Unable to fetch the information for your query."}
-
+# ==========================================================
+# === DISPLAY RESULTS (CLEAN JSON) ===
+# ==========================================================
 def display_results(result):
-    """Display query results with sample"""
     if result and "items" in result:
-        total_records = len(result['items'])
-        print(f"\n✓ Query returned {total_records} records")
+        items = result["items"]
+        total = len(items)
+        urls = sum(1 for i in items if "netsuiteUrl" in i)
+        print(f"\n✓ Query returned {total} records ({urls} URLs generated)")
         print("=" * 60)
         
-        # Show first 3 records as sample
-        print("\n📋 Sample Records (first 3 of {}):\n".format(total_records))
-        for i, item in enumerate(result["items"][:3], 1):
-            print(f"Record {i}:")
-            print(json.dumps(item, indent=2))
-            print()
+        for i, item in enumerate(items[:3], 1):
+            print(f"\nRecord {i}:")
+            # Print compact JSON without spaces
+            print(json.dumps(item, separators=(',', ':')))
         
-        if total_records > 3:
-            print(f"... and {total_records - 3} more records")
+        if total > 3:
+            print(f"\n... and {total-3} more records")
     else:
         print("\n✗ No data returned")
 
+
+# ==========================================================
+# === MAIN LOOP ===
+# ==========================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("NL2SQL Generator with Complete Dataset Summarization")
-    print(f"Using: {INFERENCE_PROFILE_ARN}")
+    print("NL2SQL Generator with NetSuite URL Support (KB-Powered)")
+    print(f"Account: {ACCOUNT_ID}")
+    print(f"Model: {INFERENCE_PROFILE_ARN}")
     print("=" * 60)
-
+    
     while True:
         nlq = input("\nEnter your natural language query (or 'exit'): ")
         if nlq.lower() == "exit":
             break
-
-        print("\n" + "=" * 60)
-        print("PROCESSING QUERY")
-        print("=" * 60)
+        
+        # Clear URL cache for fresh query
+        URL_COMPONENT_CACHE.clear()
         
         try:
-            # Try the query with 5 attempts
-            result = process_query_with_retry(nlq, max_attempts=5)
-            
+            result = process_query_with_retry(nlq)
             if result["success"]:
-                # Display sample records
                 display_results(result["data"])
-                
-                # Generate and display comprehensive summary
                 print("\n" + "=" * 60)
-                print("COMPREHENSIVE SUMMARY (ALL RECORDS)")
+                print("SUMMARY (JSON)")
                 print("=" * 60)
-                summary = summarize_results(result["natural_query"], result["sql"], result["data"])
-                print("\n" + summary)
-                print("\n" + "=" * 60)
+                summary = summarize_results(result["nlq"], result["sql"], result["data"])
+                print(summary)  # Already compact JSON
             else:
-                print(f"\n{'='*60}")
                 print(result["message"])
-                print(f"{'='*60}")
-                
         except Exception as e:
             logging.error(f"Unexpected error: {e}")
-            print(f"\n✗ An unexpected error occurred: {e}")
+            print(f"✗ Unexpected error: {e}")
