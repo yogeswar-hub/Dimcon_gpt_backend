@@ -1,11 +1,18 @@
 import logging
 import json
 import time
+import boto3
+import os
+from decimal import Decimal as decimal
 from app.final_suiteql import process_query_with_retry, summarize_results
 from app.charting import generate_chart_specs_for_suiteql, extract_axes_from_nlq_ai
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+WEBSOCKET_SESSION_TABLE_NAME = os.environ["WEBSOCKET_SESSION_TABLE_NAME"]
+dynamodb_client = boto3.resource("dynamodb")
+table = dynamodb_client.Table(WEBSOCKET_SESSION_TABLE_NAME)
 
 def process_nl2sql_query(nlq: str, limit: int = None, notificator=None) -> dict:
     # Overall processing start time
@@ -335,3 +342,46 @@ def process_nl2sql_query(nlq: str, limit: int = None, notificator=None) -> dict:
             logger.info(f"[TIMING] Error notification sent in {notification_time:.3f}ms")
         
         return {"error": str(e), "timing": final_result["timing"]}
+    
+def save_suiteql_query_record(connection_id, nlq, generated_sql, result_data, feedback="default", user_id=None):
+    logger.info(f"[SuiteQL Save] Saving NLQ record for connection_id={connection_id}, user_id={user_id}, feedback={feedback}")
+    logger.debug(f"[SuiteQL Save] NLQ: {nlq}")
+    logger.debug(f"[SuiteQL Save] Generated SQL: {generated_sql}")
+    logger.debug(f"[SuiteQL Save] Result Data: {result_data}")
+
+    response = table.query(
+        KeyConditionExpression=boto3.dynamodb.conditions.Key("ConnectionId").eq(connection_id),
+        ProjectionExpression="MessagePartId"
+    )
+    existing_ids = [item["MessagePartId"] for item in response.get("Items", [])]
+    next_id = max(existing_ids, default=0) + 1
+
+    item = {
+        "ConnectionId": connection_id,
+        "MessagePartId": decimal(next_id),
+        "NLQ": nlq,
+        "GeneratedSQL": generated_sql,
+        "ResultData": result_data,
+        "Feedback": feedback,
+    }
+    if user_id:
+        item["UserId"] = user_id
+
+    table.put_item(Item=item)
+    logger.info(f"[SuiteQL Save] Record saved with MessagePartId={next_id}")
+
+def update_suiteql_feedback(connection_id, message_part_id, feedback, feedback_comment=None):
+    update_expr = "SET Feedback = :f"
+    expr_attr_vals = {":f": feedback}
+    if feedback_comment is not None:
+        update_expr += ", FeedbackComment = :fc"
+        expr_attr_vals[":fc"] = feedback_comment
+    table.update_item(
+        Key={
+            "ConnectionId": connection_id,
+            "MessagePartId": decimal(message_part_id)
+        },
+        UpdateExpression=update_expr,
+        ExpressionAttributeValues=expr_attr_vals
+    )
+    logger.info(f"[SuiteQL Update] Feedback updated for ConnectionId={connection_id}, MessagePartId={message_part_id} to '{feedback}', comment='{feedback_comment}'")

@@ -64,6 +64,128 @@ def retrieve_from_kb(query: str, num_results: int = 5) -> str:
 
 
 # ==========================================================
+# === MANDATORY FIELDS DETECTION (DYNAMIC KB-BASED) ===
+# === NO HARDCODING - READS DIRECTLY FROM KB ===
+# ==========================================================
+
+def get_mandatory_fields_from_kb(user_query: str) -> tuple:
+    """
+    Try to retrieve mandatory fields from KB (JSONL format).
+    Uses LLM to intelligently match query to record types.
+    
+    Returns: (found: bool, instruction: str)
+    """
+    # Step 1: Retrieve all mandatory field records from KB
+    kb_result = retrieve_from_kb("mandatory_fields record_type", num_results=20)
+    
+    if not kb_result or "{" not in kb_result:
+        logging.info("⚠️ No mandatory fields data in KB - using natural field selection")
+        return (False, "")
+    
+    # Step 2: Parse all JSONL records
+    all_records = []
+    for line in kb_result.split('\n'):
+        line = line.strip()
+        if not line or not line.startswith('{'):
+            continue
+        
+        try:
+            data = json.loads(line)
+            if 'record_type' in data and 'mandatory_fields' in data:
+                all_records.append(data)
+        except json.JSONDecodeError:
+            continue
+    
+    if not all_records:
+        logging.info("⚠️ No valid mandatory fields records found in KB")
+        return (False, "")
+    
+    # Step 3: Use LLM to match query to record type
+    record_type_list = [r.get('record_type') for r in all_records]
+    
+    matching_prompt = f"""You are a record type matcher. Given a user query and a list of available record types, determine which record type the user is asking about.
+
+User Query: "{user_query}"
+
+Available Record Types:
+{chr(10).join(f"- {rt}" for rt in record_type_list)}
+
+Instructions:
+1. Analyze the user's query to understand what type of data they want
+2. Match it to ONE of the available record types above
+3. Consider synonyms (e.g., "items" = "Inventory Item", "invoices" = "Invoice", "orders" = "Sales Order" or "Purchase Order")
+4. If the query mentions multiple possible types, pick the most specific one
+5. If no record type matches, respond with "NONE"
+
+Respond with ONLY the matching record type name (exactly as shown above) or "NONE".
+
+Examples:
+Query: "show me inventory items" → Inventory Item
+Query: "list all customers" → Customer  
+Query: "what are the open sales orders" → Open Sales Order
+Query: "get employee data" → Employee
+Query: "show invoices" → Invoice (if available)
+Query: "show departments" → NONE (if not in list)
+
+Your response (one line only):"""
+    
+    try:
+        # Call LLM for matching
+        response = bedrock_runtime.invoke_model(
+            modelId=INFERENCE_PROFILE_ARN,
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 50,
+                "temperature": 0,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": matching_prompt
+                    }
+                ]
+            })
+        )
+        
+        response_body = json.loads(response['body'].read())
+        matched_type = response_body['content'][0]['text'].strip()
+        
+        logging.info(f"🤖 LLM matched query to: '{matched_type}'")
+        
+        # Find the matching record
+        if matched_type != "NONE":
+            for record in all_records:
+                if record.get('record_type') == matched_type:
+                    fields = record.get('mandatory_fields', [])
+                    if fields:
+                        field_list = ', '.join(fields)
+                        logging.info(f"✓ Found mandatory fields for '{matched_type}': {field_list}")
+                        
+                        instruction = f"""MANDATORY FIELDS FOR {matched_type.upper()} (STRICT - ONLY THESE FIELDS):
+
+**YOU MUST INCLUDE EXACTLY THESE FIELDS IN YOUR SELECT CLAUSE:**
+- id (always required)
+- {field_list}
+
+**YOU MUST NOT INCLUDE ANY OTHER FIELDS.**
+Do not add: email, phone, address, status, date fields, or any other fields not listed above.
+
+ONLY SELECT: id, {field_list}
+
+These fields are NON-NEGOTIABLE and EXCLUSIVE. No additional fields permitted."""
+                        return (True, instruction)
+        
+        logging.info(f"⚠️ LLM returned '{matched_type}' - no matching record found in KB")
+        return (False, "")
+        
+    except Exception as e:
+        logging.error(f"Error using LLM for matching: {e}")
+        logging.info("⚠️ Falling back to natural field selection")
+        return (False, "")
+
+
+# ==========================================================
 # === SQL CLEANUP ===
 # ==========================================================
 def clean_sql_query(sql_query: str) -> str:
@@ -199,7 +321,7 @@ def get_url_components_from_llm(record_type: str, table_name: str = None) -> dic
     cache_key = f"{table_name}:{record_type}" if table_name else record_type
     
     if cache_key in URL_COMPONENT_CACHE:
-        logging.info(f"Using cached URL components for {cache_key}")
+        logging.debug(f"Using cached URL components for {cache_key}")
         return URL_COMPONENT_CACHE[cache_key]
     
     try:
@@ -212,193 +334,191 @@ def get_url_components_from_llm(record_type: str, table_name: str = None) -> dic
         url_context = retrieve_from_kb(url_query, num_results=10)
         
         user_message = f"""
-Based on the following official NetSuite URL structure documentation:
+Based on this context about NetSuite URL structures:
 
 {url_context}
 
-Determine the correct module, submodule, and record file name (without .nl extension)
-for the record type '{record_type}'{f" from the {table_name} table" if table_name else ""}.
+For record type: {record_type}
+{f'From table: {table_name}' if table_name else ''}
 
-Important context:
-- If this is from the 'item' table, use item URL structure from Module 1
-- If this is from the 'customer' or entity-related table, use entity URL structure from Module 1
-- If this is from the 'transaction' table with recordtype='{record_type}', use transaction URL structure from Module 2
-- If this is from the 'vendor' table, use vendor URL structure from Module 1
-- If this is from the 'employee' table, use employee URL structure from Module 1
-- If this is from the 'account', 'department', 'class', 'location', 'subsidiary' tables, use otherlists URL structure from Module 1
-
-Search the documentation carefully and return the exact URL components.
-
-Return ONLY valid JSON like:
+Provide the URL components in JSON format:
 {{
-  "module": "<module>",
-  "submodule": "<submodule>",
-  "record_file": "<record_file>"
+  "app": "common or accounting or...?",
+  "type": "entity or transaction or...?",
+  "page": "custjob.nl or item.nl or...?"
 }}
+
+Return ONLY valid JSON, no explanation.
 """
+        
         payload = {
             "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 500,
-            "temperature": 0,
+            "max_tokens": 300,
+            "temperature": 0.1,
             "system": URL_GENERATION_PROMPT,
             "messages": [{"role": "user", "content": user_message}],
         }
+        
         response = bedrock_runtime.invoke_model(
             modelId=INFERENCE_PROFILE_ARN,
             body=json.dumps(payload),
             contentType="application/json",
         )
-        response_body = json.loads(response["body"].read())
-        model_output = response_body["content"][0]["text"].strip()
+        body = json.loads(response["body"].read())
+        response_text = body["content"][0]["text"].strip()
         
-        # Clean markdown fences
-        model_output = re.sub(
-            r"^```(?:json)?", "", model_output.strip(), flags=re.IGNORECASE
-        )
-        model_output = re.sub(r"```$", "", model_output.strip())
-        model_output = model_output.strip()
+        # Clean response
+        response_text = re.sub(r"```(?:json)?", "", response_text).strip()
         
-        components = json.loads(model_output)
-        clean_data = {
-            "module": components.get("module", "").strip(),
-            "submodule": components.get("submodule", "").strip(),
-            "record_file": components.get("record_file", "")
-            .replace(".nl", "")
-            .strip(),
-        }
+        url_components = json.loads(response_text)
+        URL_COMPONENT_CACHE[cache_key] = url_components
         
-        URL_COMPONENT_CACHE[cache_key] = clean_data
-        logging.info(f"Cached URL components for {cache_key}: {clean_data}")
-        return clean_data
-        
+        return url_components
+    
     except Exception as e:
-        logging.error(f"Error getting URL components from LLM: {e}")
+        logging.error(f"Failed to get URL components for {record_type}: {e}")
         return None
 
 
 # ==========================================================
-# === LOCAL URL CONSTRUCTION ===
+# === ENRICH RESULTS WITH URLS ===
 # ==========================================================
-def construct_netsuite_url_from_components(account_id: str, components: dict, record_id: str) -> str:
-    if not components or not all(k in components for k in ("module", "submodule", "record_file")):
-        return None
-    return f"https://{account_id}.app.netsuite.com/app/{components['module']}/{components['submodule']}/{components['record_file']}.nl?id={record_id}"
-
-
-# ==========================================================
-# === ENRICH RESULTS WITH URL - ENHANCED ===
-# ==========================================================
-def enrich_results_with_urls(sql_query: str, results: dict) -> dict:
-    if not results or "items" not in results:
-        return results
+def enrich_results_with_urls(sql_query: str, query_result: dict) -> dict:
+    """
+    Enrich query results with NetSuite URLs for each record.
+    """
+    items = query_result.get("items", [])
+    if not items:
+        return query_result
     
     enriched_items = []
-    total_items = len(results["items"])
-    print(f"\n→ Generating NetSuite URLs for {total_items} records...")
     
-    success_count = 0
-    
-    # Detect record type once from the first item (they should all be the same type)
-    if results["items"]:
-        first_item = results["items"][0]
-        record_type, table_name = detect_record_type(sql_query, first_item)
-        logging.info(f"Detected record_type='{record_type}', table_name='{table_name}' from SQL query")
+    for item in items:
+        # Remove the links field from NetSuite API response
+        if "links" in item:
+            del item["links"]
         
-        if record_type and table_name:
-            # Get URL components once for all records
-            components = get_url_components_from_llm(record_type, table_name)
+        record_type, table_name = detect_record_type(sql_query, item)
+        
+        if not record_type:
+            enriched_items.append(item)
+            continue
+        
+        # Get URL components from LLM
+        url_components = get_url_components_from_llm(record_type, table_name)
+        
+        if url_components and "id" in item:
+            record_id = item["id"]
             
-            if components:
-                logging.info(f"URL components for {table_name}: {components}")
-                
-                # Apply to all records
-                for idx, item in enumerate(results["items"], 1):
-                    enriched_item = {}
-                    record_id = item.get("id") or item.get("internalid")
-                    
-                    # Copy all fields except 'links' and convert keys to camelCase
-                    for key, value in item.items():
-                        if key == "links":
-                            continue  # Skip links field
-                        # Convert snake_case to camelCase
-                        camel_key = re.sub(r'_([a-z])', lambda m: m.group(1).upper(), key)
-                        enriched_item[camel_key] = value
-                    
-                    # Add URL if we have an ID
-                    if record_id:
-                        url = construct_netsuite_url_from_components(ACCOUNT_ID, components, record_id)
-                        if url:
-                            enriched_item["netsuiteUrl"] = url
-                            success_count += 1
-                    
-                    enriched_items.append(enriched_item)
-                    
-                    if total_items > 10 and idx % 10 == 0:
-                        print(f"  Progress: {idx}/{total_items} URLs generated...")
-            else:
-                logging.error(f"Failed to get URL components for record_type={record_type}, table={table_name}")
-                enriched_items = results["items"]
-        else:
-            logging.error(f"Could not detect record type from SQL query")
-            enriched_items = results["items"]
+            # Build NetSuite URL
+            app = url_components.get("app", "common")
+            type_ = url_components.get("type", "entity")
+            page = url_components.get("page", "custjob.nl")
+            
+            netsuite_url = f"https://{ACCOUNT_ID}.app.netsuite.com/app/{app}/{type_}/{page}?id={record_id}"
+            
+            # Add URL to item
+            item["netsuiteUrl"] = netsuite_url
+        
+        enriched_items.append(item)
     
-    results["items"] = enriched_items
-    print(f"✓ Successfully generated {success_count} NetSuite URLs")
-    return results
+    query_result["items"] = enriched_items
+    return query_result
 
 
 # ==========================================================
-# === DATA ANALYSIS / STATISTICS ===
+# === DATA STATISTICS ANALYSIS ===
 # ==========================================================
 def analyze_data_statistics(items: list) -> dict:
+    """
+    Analyze dataset to provide statistics for summarization.
+    """
     if not items:
         return {"total_records": 0}
     
     stats = {
         "total_records": len(items),
         "numeric_fields": {},
-        "categorical_fields": {},
-        "url_count": sum(1 for i in items if "netsuite_url" in i),
+        "categorical_fields": {}
     }
     
-    all_fields = set(k for item in items for k in item.keys() if k != "netsuite_url")
-    
-    for field in all_fields:
-        values = [item.get(field) for item in items if item.get(field) is not None]
-        if not values:
-            continue
-        
-        try:
-            numeric_values = [float(v) for v in values if str(v).replace(".", "", 1).replace("-", "", 1).isdigit()]
-            if numeric_values:
-                stats["numeric_fields"][field] = {
-                    "count": len(numeric_values),
-                    "sum": round(sum(numeric_values), 2),
-                    "avg": round(sum(numeric_values) / len(numeric_values), 2),
-                    "min": round(min(numeric_values), 2),
-                    "max": round(max(numeric_values), 2),
-                }
-            elif len(set(values)) <= 20:
-                value_counts = {str(v): values.count(v) for v in set(values)}
-                stats["categorical_fields"][field] = value_counts
-        except Exception:
-            continue
+    # Analyze each field
+    if items:
+        sample_item = items[0]
+        for field in sample_item.keys():
+            if field == "netsuiteUrl":
+                continue
+            
+            values = [item.get(field) for item in items if item.get(field) is not None]
+            if not values:
+                continue
+            
+            try:
+                # Try to convert to numeric
+                numeric_values = []
+                for v in values:
+                    try:
+                        numeric_values.append(float(v))
+                    except (ValueError, TypeError):
+                        pass
+                
+                if len(numeric_values) > len(values) * 0.5:  # More than 50% numeric
+                    stats["numeric_fields"][field] = {
+                        "count": len(numeric_values),
+                        "sum": round(sum(numeric_values), 2),
+                        "avg": round(sum(numeric_values) / len(numeric_values), 2),
+                        "min": round(min(numeric_values), 2),
+                        "max": round(max(numeric_values), 2),
+                    }
+                elif len(set(values)) <= 20:
+                    value_counts = {str(v): values.count(v) for v in set(values)}
+                    stats["categorical_fields"][field] = value_counts
+            except Exception:
+                continue
     
     return stats
 
 
 # ==========================================================
-# === SQL GENERATION ===
+# === SQL GENERATION WITH KB-FIRST MANDATORY FIELDS ===
 # ==========================================================
 def generate_sql_with_cross_region(user_query: str, schema_context: str, error_context: str = None) -> str:
-    message = f"""Schema from KB:
+    """
+    Generate SQL query with KB-first approach for mandatory fields.
+    
+    If mandatory fields found in KB: Enforce them strictly
+    If not found: Use natural LLM field selection
+    """
+    # Try to get mandatory fields from KB
+    found_mandatory, mandatory_instruction = get_mandatory_fields_from_kb(user_query)
+    
+    if found_mandatory:
+        # STRICT MODE: Mandatory fields found in KB
+        message = f"""Schema from KB:
+
+{schema_context}
+
+{mandatory_instruction}
+
+User Query: {user_query}
+
+{f'Error previously: {error_context}' if error_context else ''}
+
+CRITICAL: You MUST include ALL the mandatory fields listed above in your SELECT clause.
+Always include id field. For transaction queries, include recordtype field. 
+Return only SQL."""
+    else:
+        # NATURAL MODE: No mandatory fields, use LLM's judgment
+        message = f"""Schema from KB:
 
 {schema_context}
 
 User Query: {user_query}
 
 {f'Error previously: {error_context}' if error_context else ''}
-Always include id field. For transaction queries, include recordtype field. Return only SQL."""
+
+Include relevant fields based on the user's query. Always include id field. 
+For transaction queries, include recordtype field. Return only SQL."""
     
     payload = {
         "anthropic_version": "bedrock-2023-05-31",
@@ -433,61 +553,59 @@ def run_suiteql_query(sql_query: str):
 
 
 # ==========================================================
-# === RETRY LOGIC ===
+# === RETRY LOGIC WITH MODE VISIBILITY ===
 # ==========================================================
 def process_query_with_retry(nlq: str, max_attempts: int = 5, notificator=None):
     attempted = []
     error_context = None
-
+    
+    # Check mode once before attempts
+    found_mandatory, _ = get_mandatory_fields_from_kb(nlq)
+    mode = "MANDATORY FIELDS MODE" if found_mandatory else "NATURAL SELECTION MODE"
+    
     for attempt in range(1, max_attempts + 1):
-        # Professional attempt start message
+        print(f"\n{'='*60}")
+        print(f"Attempt {attempt}/{max_attempts} - {mode}")
+        print(f"{'='*60}")
+        
+        # Add notification for attempt start if notificator exists
         if notificator:
             notificator.notify(json.dumps({
-                "status": "ATTEMPT_START",
+                "status": "ATTEMPT_START", 
                 "attempt": attempt,
-                "message": f"Processing attempt {attempt} of {max_attempts} - Analyzing your query and preparing data..."
+                "message": f"Processing attempt {attempt} of {max_attempts}...",
+                "timestamp": time.time() * 1000
             }).encode("utf-8"))
-
-        print(f"\n{'='*60}\nAttempt {attempt}/{max_attempts}\n{'='*60}")
-
-        schema = retrieve_from_kb(nlq)
+        
+        schema = retrieve_from_kb(nlq, num_results=5)
         sql = generate_sql_with_cross_region(nlq, schema, error_context)
-        # Format SQL as single line
-        sql_single_line = " ".join(sql.split())
-
-        if sql_single_line in attempted:
+        
+        if sql in attempted:
             print("⚠️ Duplicate SQL generated, skipping...")
             continue
-
-        attempted.append(sql_single_line)
-        print(f"\n✓ Generated SQL:\n{sql_single_line}\n")
-        result = run_suiteql_query(sql_single_line)
-
+        
+        attempted.append(sql)
+        print(f"\n✓ Generated SQL:\n{sql}\n")
+        
+        result = run_suiteql_query(sql)
+        
         if result["success"]:
-            enriched = enrich_results_with_urls(sql_single_line, result["data"])
-            return {"success": True, "sql": sql_single_line, "nlq": nlq, "data": enriched}
+            enriched = enrich_results_with_urls(sql, result["data"])
+            return {"success": True, "sql": sql, "nlq": nlq, "data": enriched}
         else:
             error_context = result["error"]
             print(f"✗ Query failed: {error_context}")
             
-            # Professional failure message
+            # Add notification for failed attempt if notificator exists
             if notificator:
                 notificator.notify(json.dumps({
                     "status": "ATTEMPT_FAILED",
                     "attempt": attempt,
-                    "message": f"Attempt {attempt} unsuccessful - Trying alternative approach {attempt + 1}...",
-                    "sql_query": sql_single_line,
-                    "error": error_context
+                    "message": f"Attempt {attempt} failed: {error_context}",
+                    "sql_query": sql,
+                    "timestamp": time.time() * 1000
                 }).encode("utf-8"))
-    # ...existing code...
-
-    # Professional final failure message
-    if notificator:
-        notificator.notify(json.dumps({
-            "status": "ALL_ATTEMPTS_FAILED",
-            "message": "Unable to retrieve the requested data after multiple attempts. Please try rephrasing your question or verify the data exists in NetSuite."
-        }).encode("utf-8"))
-
+    
     return {"success": False, "message": "Unable to fetch the information for your query."}
 
 
@@ -582,19 +700,83 @@ def display_results(result):
 
 
 # ==========================================================
+# === UTILITY: KB HEALTH CHECK (UPDATED FOR JSONL) ===
+# ==========================================================
+def check_kb_mandatory_fields_coverage():
+    """
+    Utility function to check if mandatory fields are properly indexed in KB.
+    Run this periodically to verify KB health.
+    """
+    print("\n" + "="*60)
+    print("KNOWLEDGE BASE MANDATORY FIELDS CHECK")
+    print("="*60)
+    
+    # Retrieve all mandatory field records from KB
+    kb_result = retrieve_from_kb("mandatory_fields record_type", num_results=20)
+    
+    if not kb_result or "{" not in kb_result:
+        print("\n✗ ERROR: No JSONL data found in KB")
+        print("Make sure your mandatory_fields_latest.jsonl is uploaded and synced.")
+        return
+    
+    # Parse all JSONL records
+    all_records = []
+    for line in kb_result.split('\n'):
+        line = line.strip()
+        if line.startswith('{'):
+            try:
+                data = json.loads(line)
+                if 'record_type' in data and 'mandatory_fields' in data:
+                    all_records.append(data)
+            except json.JSONDecodeError:
+                continue
+    
+    if not all_records:
+        print("\n✗ ERROR: Found JSON data but couldn't parse records")
+        return
+    
+    print(f"\n✓ SUCCESS: Found {len(all_records)} record types in KB")
+    print("="*60)
+    
+    for i, record in enumerate(all_records, 1):
+        record_type = record.get('record_type', 'Unknown')
+        fields = record.get('mandatory_fields', [])
+        field_count = len(fields)
+        
+        print(f"\n{i}. {record_type.upper()}: ✓ FOUND ({field_count} mandatory fields)")
+        print(f"   Fields: {', '.join(fields)}")
+    
+    print("\n" + "="*60)
+    print(f"Total: {len(all_records)} record types with mandatory fields")
+    print("="*60)
+
+
+# ==========================================================
 # === MAIN LOOP ===
 # ==========================================================
 if __name__ == "__main__":
     print("=" * 60)
     print("NL2SQL Generator with NetSuite URL Support (KB-Powered)")
+    print("KB-First Mandatory Fields with Natural Fallback")
     print(f"Account: {ACCOUNT_ID}")
     print(f"Model: {INFERENCE_PROFILE_ARN}")
     print("=" * 60)
     
+    # Optional: Uncomment to run KB health check on startup
+    # print("\nRunning KB Health Check...")
+    # check_kb_mandatory_fields_coverage()
+    # print("\nStarting query loop...\n")
+    
     while True:
-        nlq = input("\nEnter your natural language query (or 'exit'): ")
+        nlq = input("\nEnter your natural language query (or 'exit' to quit, 'check' for KB health): ")
+        
         if nlq.lower() == "exit":
+            print("Goodbye!")
             break
+        
+        if nlq.lower() == "check":
+            check_kb_mandatory_fields_coverage()
+            continue
         
         # Clear URL cache for fresh query
         URL_COMPONENT_CACHE.clear()

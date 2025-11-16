@@ -15,7 +15,7 @@ from app.routes.schemas.conversation import ChatInput
 from app.stream import OnStopInput, OnThinking
 from app.usecases.chat import chat
 from app.user import User
-from app.suiteql_service import process_nl2sql_query
+from app.suiteql_service import process_nl2sql_query, save_suiteql_query_record, update_suiteql_feedback
 from boto3.dynamodb.conditions import Attr, Key
 
 def _json_default(obj):
@@ -27,7 +27,6 @@ def _json_default(obj):
     return str(obj)
 
 WEBSOCKET_SESSION_TABLE_NAME = os.environ["WEBSOCKET_SESSION_TABLE_NAME"]
-
 dynamodb_client = boto3.resource("dynamodb")
 table = dynamodb_client.Table(WEBSOCKET_SESSION_TABLE_NAME)
 
@@ -223,6 +222,13 @@ def handler(event, context):
     body = json.loads(event["body"])
     step = body.get("step")
     token = body.get("token")
+    user_id = None
+    if token:
+        try:
+            decoded = verify_token(token)
+            user_id = decoded.get("sub")
+        except Exception as e:
+            logger.warning(f"Could not decode token for user: {e}")
 
     notification_thread = Thread(target=lambda: notificator.run(), daemon=True)
     notification_thread.start()
@@ -248,19 +254,13 @@ def handler(event, context):
 
             logger.info(f"SuiteQL route called with NLQ: {nlq}")
 
-            # Store connectionId in DynamoDB for this SuiteQL session
-            db_start = time.time()
-            table.put_item(
-                Item={
-                    "ConnectionId": connection_id,
-                    "MessagePartId": decimal(0),
-                    "Step": "SUITEQL",
-                    "NLQ": nlq,
-                    "expire": expire,
-                }
+            # Get the next MessagePartId for this connection
+            response = table.query(
+                KeyConditionExpression=Key("ConnectionId").eq(connection_id),
+                ProjectionExpression="MessagePartId"
             )
-            db_time = (time.time() - db_start) * 1000
-            logger.info(f"[TIMING] DynamoDB storage completed in {db_time:.3f}ms for connectionId {connection_id}")
+            existing_ids = [item["MessagePartId"] for item in response.get("Items", [])]
+            next_id = max(existing_ids, default=0) + 1
 
             # Initial processing notification
             notification_start = time.time()
@@ -337,10 +337,37 @@ def handler(event, context):
             logger.info(f"[TIMING] Total WebSocket handler time: {websocket_total_time:.3f}ms")
             logger.info("SuiteQL result notification sent.")
             
-            # REMOVED: notificator.notify(json.dumps(notification_payload, default=_json_default).encode("utf-8"))
-            # Do not send SUITEQL_RESULT notification
+            # Save the SuiteQL query record (after processing)
+            save_suiteql_query_record(
+                connection_id=connection_id,
+                nlq=nlq,
+                generated_sql=result.get("sql_query"),
+                result_data=json.dumps(result),
+                feedback="default",
+                user_id=user_id
+            )
+            # After saving, get the next_id again (or refactor save_suiteql_query_record to return it)
+            response = table.query(
+                KeyConditionExpression=Key("ConnectionId").eq(connection_id),
+                ProjectionExpression="MessagePartId"
+            )
+            existing_ids = [item["MessagePartId"] for item in response.get("Items", [])]
+            message_part_id = max(existing_ids, default=0)  # This is the latest MessagePartId
 
-            return {"statusCode": 200, "body": "SuiteQL processed."}
+            # After saving the SuiteQL query record and getting message_part_id:
+            notificator.notify(json.dumps({
+                "connection_id": connection_id,
+                "message_part_id": int(message_part_id)
+            }).encode("utf-8"))
+
+            return {
+                "statusCode": 200,
+                "body": json.dumps({
+                    "message": "SuiteQL processed.",
+                    "connection_id": connection_id,
+                    "message_part_id": int(message_part_id)
+                }),
+            }
 
         if step == "START":
             try:
@@ -406,6 +433,33 @@ def handler(event, context):
             notificator.notify(json.dumps({"status": "MESSAGE_PROCESSED", "message": "Message processed."}).encode("utf-8"))
             logger.info("Message processed notification sent.")
             return result
+
+        elif step == "FEEDBACK_UPDATE":
+            connection_id = body.get("connection_id")
+            message_part_id = body.get("message_part_id")
+            feedback = body.get("feedback")
+            feedback_comment = body.get("feedback_comment")  # <-- new line
+            logger.info(f"[WebSocket] Received feedback update request: ConnectionId={connection_id}, MessagePartId={message_part_id}, Feedback={feedback}, Comment={feedback_comment}")
+            if not (connection_id and message_part_id and feedback):
+                logger.warning("[WebSocket] Missing feedback update parameters.")
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": "Missing feedback update parameters."}),
+                }
+            update_suiteql_feedback(connection_id, message_part_id, feedback, feedback_comment)  # <-- pass comment
+            notificator.notify(json.dumps({
+                "status": "FEEDBACK_UPDATED",
+                "connection_id": connection_id,
+                "message_part_id": message_part_id,
+                "feedback": feedback,
+                "feedback_comment": feedback_comment,  # <-- include comment
+                "message": "Feedback updated successfully."
+            }).encode("utf-8"))
+            logger.info(f"[WebSocket] Feedback update notification sent for ConnectionId={connection_id}, MessagePartId={message_part_id}")
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"message": "Feedback updated."}),
+            }
 
         else:
             part_index = body["index"] + 1
